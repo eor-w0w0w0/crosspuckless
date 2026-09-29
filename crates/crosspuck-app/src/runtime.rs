@@ -111,12 +111,14 @@ impl MenuView {
 #[derive(Clone, Debug)]
 pub struct AppState {
     state: Arc<Mutex<HostRuntimeState>>,
+    force_reconnect: Arc<AtomicBool>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(HostRuntimeState::Starting)),
+            force_reconnect: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -127,6 +129,18 @@ impl AppState {
             .unwrap_or_else(|_| HostRuntimeState::Degraded {
                 reason: "state lock poisoned".to_string(),
             })
+    }
+
+    pub fn request_reconnect(&self) {
+        self.force_reconnect.store(true, Ordering::Relaxed);
+    }
+
+    fn take_reconnect_request(&self) -> bool {
+        self.force_reconnect.swap(false, Ordering::Relaxed)
+    }
+
+    fn clear_reconnect_request(&self) {
+        self.force_reconnect.store(false, Ordering::Relaxed);
     }
 
     fn set(&self, state: HostRuntimeState) {
@@ -349,6 +363,7 @@ fn handle_session(
         ));
     }
 
+    app_state.clear_reconnect_request();
     let (mode, snapshot) = match with_worker_autorelease_pool(snapshot_for_any_known_mode) {
         Ok(found) => found,
         Err(error) => {
@@ -536,8 +551,13 @@ fn run_attached_session(
 
     let input_running = Arc::new(AtomicBool::new(true));
     let input_thread = spawn_input_stream(input, Arc::clone(&backend), Arc::clone(&input_running))?;
-    let control_result =
-        run_control_loop(control, backend.as_ref(), session.session_trace_id, stop);
+    let control_result = run_control_loop(
+        control,
+        backend.as_ref(),
+        session.session_trace_id,
+        app_state,
+        stop,
+    );
     input_running.store(false, Ordering::Relaxed);
     let _ = input_thread.join();
     with_worker_autorelease_pool(|| backend.cleanup_feedback());
@@ -553,11 +573,16 @@ fn run_control_loop(
     control: &mut ChannelStream,
     backend: &dyn HostBackend,
     session_trace_id: u32,
+    app_state: &AppState,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), RuntimeError> {
     let session_trace = session_trace_label(session_trace_id);
     loop {
         if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if app_state.take_reconnect_request() {
+            log::info!("CrossPuck[{session_trace}] reconnect requested; ending session");
             return Ok(());
         }
         let frame = match control.read_frame() {

@@ -85,6 +85,7 @@ mod macos {
         _refresh_timer: Retained<NSTimer>,
         _driver_controller: Retained<DriverInstallController>,
         _bottle_controller: Retained<BottleController>,
+        _reconnect_controller: Retained<ReconnectController>,
         _quit_controller: Retained<QuitController>,
     }
 
@@ -305,6 +306,33 @@ mod macos {
         }
     }
 
+    struct ReconnectControllerIvars {
+        app_state: AppState,
+    }
+
+    define_class!(
+        #[unsafe(super = NSObject)]
+        #[thread_kind = objc2::MainThreadOnly]
+        #[ivars = ReconnectControllerIvars]
+        struct ReconnectController;
+
+        unsafe impl NSObjectProtocol for ReconnectController {}
+
+        impl ReconnectController {
+            #[unsafe(method(forceReconnect:))]
+            fn force_reconnect(&self, _sender: Option<&AnyObject>) {
+                self.ivars().app_state.request_reconnect();
+            }
+        }
+    );
+
+    impl ReconnectController {
+        fn new(mtm: MainThreadMarker, app_state: AppState) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(ReconnectControllerIvars { app_state });
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
     struct QuitControllerIvars {
         app: Retained<NSApplication>,
         service_handle: HostServiceHandle,
@@ -480,6 +508,11 @@ mod macos {
             &empty_key,
         );
         bottle_path_item.setSubmenu(Some(&bottle_menu));
+        let reconnect_item = advanced_menu.addItemWithTitle_action_keyEquivalent(
+            &NSString::from_str("Force Reconnect"),
+            Some(sel!(forceReconnect:)),
+            &empty_key,
+        );
         let advanced_item = menu.addItemWithTitle_action_keyEquivalent(
             &NSString::from_str("Advanced"),
             None,
@@ -504,6 +537,9 @@ mod macos {
         state_items
             .bottle_reset
             .setTarget(Some(bottle_controller.as_ref()));
+
+        let reconnect_controller = ReconnectController::new(mtm, app_state.clone());
+        reconnect_item.setTarget(Some(reconnect_controller.as_ref()));
 
         let menu_delegate = StateMenuDelegate::new(
             mtm,
@@ -543,6 +579,7 @@ mod macos {
             _refresh_timer: refresh_timer,
             _driver_controller: driver_controller,
             _bottle_controller: bottle_controller,
+            _reconnect_controller: reconnect_controller,
             _quit_controller: quit_controller,
         }
     }
