@@ -19,6 +19,7 @@ const FEATURE_REPORT_RETRY_DELAY: Duration = Duration::from_millis(2);
 const INPUT_REOPEN_BACKOFF: Duration = Duration::from_millis(25);
 const INPUT_ERROR_GRACE: Duration = Duration::from_secs(30);
 const INPUT_DISCONNECT_GRACE: Duration = Duration::from_secs(120);
+const INPUT_DEVICE_GONE_GRACE: Duration = Duration::from_secs(2);
 
 static HOST_LOG_SESSION_TRACE_ID: Mutex<Option<u32>> = Mutex::new(None);
 
@@ -850,6 +851,19 @@ impl CollectionInputReader {
                             self.consecutive_errors = 0;
                         }
                         Err(refresh_error)
+                            if refresh_error.is_no_matching_device()
+                                && now.duration_since(first_error_at)
+                                    >= INPUT_DEVICE_GONE_GRACE =>
+                        {
+                            warn_host_guest_event!(
+                                "HID input device gone: interface={} role={:?} path={}",
+                                self.descriptor.interface_number,
+                                self.descriptor.role,
+                                self.path_text()
+                            );
+                            return Err(refresh_error);
+                        }
+                        Err(refresh_error)
                             if self.consecutive_errors == 1
                                 || self.consecutive_errors.is_multiple_of(40) =>
                         {
@@ -991,6 +1005,12 @@ pub(crate) enum HostHidError {
     InvalidInterfaceNumber(i32),
     DeviceLockPoisoned,
     Hid(HidSnapshotError),
+}
+
+impl HostHidError {
+    fn is_no_matching_device(&self) -> bool {
+        matches!(self, Self::Hid(HidSnapshotError::NoMatchingDevice))
+    }
 }
 
 impl fmt::Display for HostHidError {

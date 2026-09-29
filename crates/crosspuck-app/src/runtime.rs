@@ -556,6 +556,7 @@ fn run_attached_session(
         backend.as_ref(),
         session.session_trace_id,
         app_state,
+        &input_running,
         stop,
     );
     input_running.store(false, Ordering::Relaxed);
@@ -574,6 +575,7 @@ fn run_control_loop(
     backend: &dyn HostBackend,
     session_trace_id: u32,
     app_state: &AppState,
+    input_running: &AtomicBool,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), RuntimeError> {
     let session_trace = session_trace_label(session_trace_id);
@@ -583,6 +585,10 @@ fn run_control_loop(
         }
         if app_state.take_reconnect_request() {
             log::info!("CrossPuck[{session_trace}] reconnect requested; ending session");
+            return Ok(());
+        }
+        if !input_running.load(Ordering::Relaxed) {
+            log::info!("CrossPuck[{session_trace}] input stream ended; ending session");
             return Ok(());
         }
         let frame = match control.read_frame() {
@@ -741,6 +747,7 @@ fn spawn_input_stream(
 ) -> Result<JoinHandle<()>, RuntimeError> {
     Ok(thread::spawn(move || {
         let Ok(mut reader) = with_worker_autorelease_pool(|| backend.open_input_reader()) else {
+            running.store(false, Ordering::Relaxed);
             return;
         };
         let start = Instant::now();
@@ -768,6 +775,7 @@ fn spawn_input_stream(
                 Err(_) => break,
             }
         }
+        running.store(false, Ordering::Relaxed);
     }))
 }
 
@@ -890,6 +898,7 @@ mod tests {
     use super::*;
     use crate::hid_backend::{HostBackend, HostInputReport, InputDescriptor, InputReportReader};
     use crosspuck_core::guest::{GuestTransportClient, GuestTransportConfig};
+    use crosspuck_core::hid::HidSnapshotError;
     use crosspuck_core::protocol::{
         Channel, CollectionDescriptor, CollectionRole, FeatureResult, IdentityPayload, LogSeverity,
         SetFeatureResult, SetOutputResult, StatusCode, WriteResult,
@@ -905,6 +914,7 @@ mod tests {
         reports: Arc<Mutex<VecDeque<Vec<u8>>>>,
         operations: Arc<Mutex<Vec<String>>>,
         cleanup_called: Arc<AtomicBool>,
+        input_gone: bool,
     }
 
     impl FakeBackend {
@@ -913,6 +923,7 @@ mod tests {
                 reports: Arc::new(Mutex::new(reports.into())),
                 operations: Arc::new(Mutex::new(Vec::new())),
                 cleanup_called: Arc::new(AtomicBool::new(false)),
+                input_gone: false,
             }
         }
 
@@ -933,6 +944,7 @@ mod tests {
         fn open_input_reader(&self) -> Result<Box<dyn InputReportReader>, HostHidError> {
             Ok(Box::new(FakeInputReader {
                 reports: Arc::clone(&self.reports),
+                gone: self.input_gone,
             }))
         }
 
@@ -982,6 +994,7 @@ mod tests {
 
     struct FakeInputReader {
         reports: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        gone: bool,
     }
 
     impl InputReportReader for FakeInputReader {
@@ -989,6 +1002,9 @@ mod tests {
             &mut self,
             _timeout: Duration,
         ) -> Result<Option<HostInputReport>, HostHidError> {
+            if self.gone {
+                return Err(HostHidError::Hid(HidSnapshotError::NoMatchingDevice));
+            }
             Ok(self
                 .reports
                 .lock()
@@ -1141,6 +1157,58 @@ mod tests {
             drop(guest);
         }
 
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn host_session_ends_when_input_device_is_gone() {
+        let listeners = TransportListeners::bind(TransportAddrs::loopback(0, 0)).unwrap();
+        let addrs = listeners.local_addrs().unwrap();
+        let backend = FakeBackend {
+            input_gone: true,
+            ..FakeBackend::new(Vec::new())
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let server = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let mut control = listeners.accept_control().unwrap();
+            let hello = control.read_frame().unwrap();
+            control
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            let result = handle_session_with_backend(
+                &listeners,
+                &mut control,
+                SessionStart {
+                    session_id: 1,
+                    session_trace_id: 0x12345,
+                    guest_runtime_overrides: GuestRuntimeOverrides::default(),
+                    hello_request_id: hello.header.id,
+                    guest_pid: 1234,
+                    mode: ConnectionMode::Puck,
+                },
+                &AppState::new(),
+                test_identity(),
+                Arc::new(backend),
+                &server_stop,
+            );
+            result_tx.send(result.is_ok()).unwrap();
+        });
+
+        ready_rx.recv().unwrap();
+        let guest = GuestTransportClient::connect(GuestTransportConfig {
+            addrs,
+            guest_label: "host-input-gone-test".to_string(),
+            ..GuestTransportConfig::default()
+        })
+        .unwrap();
+
+        assert!(result_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        drop(guest);
         server.join().unwrap();
     }
 
