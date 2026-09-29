@@ -348,7 +348,12 @@ pub fn snapshot_for_any_known_mode() -> Result<(ConnectionMode, PuckSnapshot), H
         serial: None,
     };
     let candidates = collect_candidates(&api, &vendor_filter);
+    build_snapshot_for_known_modes(&candidates)
+}
 
+pub fn build_snapshot_for_known_modes(
+    candidates: &[DeviceCandidate],
+) -> Result<(ConnectionMode, PuckSnapshot), HidSnapshotError> {
     let mut last_error = None;
     for mode in ConnectionMode::PRIORITY {
         let mode_candidates: Vec<DeviceCandidate> = candidates
@@ -505,6 +510,63 @@ mod tests {
             Some(ConnectionMode::Bluetooth)
         );
         assert_eq!(ConnectionMode::from_product_id(0x0000), None);
+    }
+
+    #[test]
+    fn known_mode_snapshot_prefers_puck_over_direct_connections() {
+        let candidates = vec![
+            candidate_for_product(STEAM_CONTROLLER_WIRED_PRODUCT_ID, 0, 0xFF00, 0x0001),
+            candidate(2, 0xFF00, 0x0001),
+        ];
+
+        let (mode, snapshot) = build_snapshot_for_known_modes(&candidates).unwrap();
+
+        assert_eq!(mode, ConnectionMode::Puck);
+        assert_eq!(
+            snapshot.identity.product_id,
+            STEAM_CONTROLLER_PUCK_PRODUCT_ID
+        );
+    }
+
+    #[test]
+    fn known_mode_snapshot_uses_only_wired_vendor_collection() {
+        let candidates = vec![
+            candidate_for_product(STEAM_CONTROLLER_WIRED_PRODUCT_ID, 0, 0x0001, 0x0002),
+            candidate_for_product(STEAM_CONTROLLER_WIRED_PRODUCT_ID, 0, 0x0001, 0x0006),
+            candidate_for_product(STEAM_CONTROLLER_WIRED_PRODUCT_ID, 0, 0xFF00, 0x0001),
+        ];
+
+        let (mode, snapshot) = build_snapshot_for_known_modes(&candidates).unwrap();
+
+        assert_eq!(mode, ConnectionMode::WiredUsb);
+        assert_eq!(snapshot.collections.len(), 1);
+        assert_eq!(snapshot.collections[0].role, HidCollectionRole::PuckMain);
+        assert_eq!(
+            snapshot.collections[0].input_report_len,
+            DIRECT_INPUT_REPORT_LEN
+        );
+    }
+
+    #[test]
+    fn known_mode_snapshot_falls_back_when_puck_has_no_mapped_collections() {
+        let candidates = vec![
+            candidate(7, 0xFF00, 0x0001),
+            candidate_for_product(STEAM_CONTROLLER_BLUETOOTH_PRODUCT_ID, -1, 0xFF00, 0x0001),
+        ];
+
+        let (mode, _) = build_snapshot_for_known_modes(&candidates).unwrap();
+
+        assert_eq!(mode, ConnectionMode::Bluetooth);
+    }
+
+    #[test]
+    fn known_mode_snapshot_ignores_unknown_valve_products() {
+        let candidates = vec![candidate_for_product(0x1142, 0, 0xFF00, 0x0001)];
+
+        assert!(matches!(
+            build_snapshot_for_known_modes(&candidates),
+            Err(HidSnapshotError::NoMatchingDevice)
+        ));
     }
 
     #[test]

@@ -1161,6 +1161,94 @@ mod tests {
     }
 
     #[test]
+    fn menu_view_labels_connection_mode() {
+        let connected = HostRuntimeState::PuckConnected {
+            serial: "FXB9961303C9C".to_string(),
+            mode: ConnectionMode::WiredUsb,
+        }
+        .menu_view();
+        assert_eq!(connected.status, "Wired USB connected");
+        assert_eq!(connected.puck, "FXB9961303C9C");
+
+        let guest = HostRuntimeState::GuestConnected {
+            session_id: 1,
+            session_trace_id: 0x12345,
+            serial: "FXB9961303C9C".to_string(),
+            guest_pid: 1234,
+            mode: ConnectionMode::Bluetooth,
+        }
+        .menu_view();
+        assert_eq!(guest.status, "Guest proxy connected (Bluetooth)");
+    }
+
+    #[test]
+    fn reconnect_request_is_taken_once_and_can_be_cleared() {
+        let app_state = AppState::new();
+        assert!(!app_state.take_reconnect_request());
+
+        app_state.request_reconnect();
+        assert!(app_state.take_reconnect_request());
+        assert!(!app_state.take_reconnect_request());
+
+        app_state.request_reconnect();
+        app_state.clear_reconnect_request();
+        assert!(!app_state.take_reconnect_request());
+    }
+
+    #[test]
+    fn host_session_ends_on_reconnect_request() {
+        let listeners = TransportListeners::bind(TransportAddrs::loopback(0, 0)).unwrap();
+        let addrs = listeners.local_addrs().unwrap();
+        let backend = FakeBackend::new(Vec::new());
+        let app_state = AppState::new();
+        let server_app_state = app_state.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let server = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let mut control = listeners.accept_control().unwrap();
+            let hello = control.read_frame().unwrap();
+            control
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            let result = handle_session_with_backend(
+                &listeners,
+                &mut control,
+                SessionStart {
+                    session_id: 1,
+                    session_trace_id: 0x12345,
+                    guest_runtime_overrides: GuestRuntimeOverrides::default(),
+                    hello_request_id: hello.header.id,
+                    guest_pid: 1234,
+                    mode: ConnectionMode::Puck,
+                },
+                &server_app_state,
+                test_identity(),
+                Arc::new(backend),
+                &server_stop,
+            );
+            result_tx.send(result.is_ok()).unwrap();
+        });
+
+        ready_rx.recv().unwrap();
+        let guest = GuestTransportClient::connect(GuestTransportConfig {
+            addrs,
+            guest_label: "host-reconnect-request-test".to_string(),
+            ..GuestTransportConfig::default()
+        })
+        .unwrap();
+
+        app_state.request_reconnect();
+        assert!(result_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert!(!app_state.take_reconnect_request());
+        drop(guest);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn host_session_ends_when_input_device_is_gone() {
         let listeners = TransportListeners::bind(TransportAddrs::loopback(0, 0)).unwrap();
         let addrs = listeners.local_addrs().unwrap();
