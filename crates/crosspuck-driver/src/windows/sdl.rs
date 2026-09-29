@@ -1,6 +1,6 @@
 use super::buffers::{input_slice, output_slice, report_id_from_buffer};
 use super::handles::{handle_for_profile, profile_for_handle};
-use super::log::{debug_line, error_line, trace_line};
+use super::log::{debug_line, error_line, info_line, trace_line};
 use super::proc::fn_from_mut;
 use super::state;
 use crosspuck_core::guest_driver::{
@@ -11,6 +11,7 @@ use std::ffi::{c_char, c_int, c_void, CString};
 use std::fmt;
 use std::ptr;
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,6 +19,7 @@ use windows_sys::core::PCSTR;
 use windows_sys::Win32::System::LibraryLoader::LoadLibraryA;
 
 type SdlHidCloseFn = unsafe extern "C" fn(*mut c_void);
+type SdlHidDeviceChangeCountFn = unsafe extern "C" fn() -> u32;
 type SdlHidEnumerateFn = unsafe extern "C" fn(u16, u16) -> *mut SdlHidDeviceInfo;
 type SdlHidFreeEnumerationFn = unsafe extern "C" fn(*mut SdlHidDeviceInfo);
 type SdlHidOpenPathFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
@@ -29,6 +31,8 @@ type SdlHidGetFeatureReportFn = unsafe extern "C" fn(*mut c_void, *mut u8, usize
 type SdlHidSendFeatureReportFn = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> c_int;
 
 static ORIGINAL_SDL_HID_CLOSE: OnceLock<SdlHidCloseFn> = OnceLock::new();
+static ORIGINAL_SDL_HID_DEVICE_CHANGE_COUNT: OnceLock<SdlHidDeviceChangeCountFn> = OnceLock::new();
+static SDL_DEVICE_CHANGE_COUNT_CALLED: AtomicBool = AtomicBool::new(false);
 static ORIGINAL_SDL_HID_ENUMERATE: OnceLock<SdlHidEnumerateFn> = OnceLock::new();
 static ORIGINAL_SDL_HID_FREE_ENUMERATION: OnceLock<SdlHidFreeEnumerationFn> = OnceLock::new();
 static ORIGINAL_SDL_HID_OPEN_PATH: OnceLock<SdlHidOpenPathFn> = OnceLock::new();
@@ -120,6 +124,12 @@ pub fn set_original_sdl_hid_close(ptr: *mut c_void) -> Result<(), String> {
         .map_err(|_| "SDL_hid_close trampoline already initialized".to_string())
 }
 
+pub fn set_original_sdl_hid_device_change_count(ptr: *mut c_void) -> Result<(), String> {
+    ORIGINAL_SDL_HID_DEVICE_CHANGE_COUNT
+        .set(unsafe { fn_from_mut(ptr) })
+        .map_err(|_| "SDL_hid_device_change_count trampoline already initialized".to_string())
+}
+
 pub fn set_original_sdl_hid_enumerate(ptr: *mut c_void) -> Result<(), String> {
     ORIGINAL_SDL_HID_ENUMERATE
         .set(unsafe { fn_from_mut(ptr) })
@@ -188,6 +198,19 @@ pub unsafe extern "C" fn detoured_sdl_hid_close(device: *mut c_void) {
     if let Some(original) = ORIGINAL_SDL_HID_CLOSE.get().copied() {
         original(device);
     }
+}
+
+pub unsafe extern "C" fn detoured_sdl_hid_device_change_count() -> u32 {
+    if !SDL_DEVICE_CHANGE_COUNT_CALLED.swap(true, Ordering::Relaxed) {
+        info_line("[crosspuck] SDL_hid_device_change_count first call");
+    }
+    let original = ORIGINAL_SDL_HID_DEVICE_CHANGE_COUNT
+        .get()
+        .copied()
+        .map_or(0, |original| original());
+    original.wrapping_add(state::device_change_generation(
+        "SDL_hid_device_change_count",
+    ))
 }
 
 pub unsafe extern "C" fn detoured_sdl_hid_enumerate(

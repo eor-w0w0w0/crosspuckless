@@ -81,6 +81,16 @@ pub fn catalog_if_connected(reason: &'static str) -> Option<VirtualHidProfileCat
     catalog
 }
 
+pub fn device_change_generation(reason: &'static str) -> u32 {
+    let Some(runtime) = runtime() else {
+        return 0;
+    };
+    if bridge_connect_allowed() {
+        let _ = catalog(reason);
+    }
+    runtime.device_generation()
+}
+
 fn log_bridge_connect_failed(
     runtime: &GuestDriverRuntime,
     reason: &'static str,
