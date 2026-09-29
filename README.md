@@ -138,6 +138,15 @@ CrossPuck.app/Contents/Resources/LICENSE
 CrossPuck.app/Contents/Resources/THIRD-PARTY-NOTICES.md
 ```
 
+Unsigned builds get a new ad-hoc signature every time, so macOS asks for
+Input Monitoring again after each rebuild. Set `CROSSPUCK_APP_SIGN_IDENTITY`
+to a codesigning identity to sign the bundle and keep the permission across
+rebuilds:
+
+```sh
+CROSSPUCK_APP_SIGN_IDENTITY="Apple Development" tools/build-app.sh release
+```
+
 ### Build A DMG
 
 Create a drag-and-drop installer DMG from the release app bundle:
