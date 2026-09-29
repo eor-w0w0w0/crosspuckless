@@ -2,6 +2,7 @@ use crate::protocol::IdentityPayload;
 
 pub const CROSSPUCK_VENDOR_ID: u16 = 0x28de;
 pub const CROSSPUCK_PRODUCT_ID: u16 = 0x1304;
+pub const CROSSPUCK_KNOWN_PRODUCT_IDS: [u16; 3] = [0x1302, 0x1303, 0x1304];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HidQueryRoute {
@@ -35,7 +36,10 @@ pub struct SetupApiQuery {
 
 pub fn classify_device_path(path: &str) -> DevicePathRoute {
     let lower = path.to_ascii_lowercase();
-    if lower.contains("hid#") && lower.contains("vid_28de") && lower.contains("pid_1304") {
+    let has_known_pid = CROSSPUCK_KNOWN_PRODUCT_IDS
+        .iter()
+        .any(|product_id| lower.contains(&format!("pid_{product_id:04x}")));
+    if lower.contains("hid#") && lower.contains("vid_28de") && has_known_pid {
         DevicePathRoute::CrossPuckCandidate
     } else {
         DevicePathRoute::NativeOnly
@@ -65,7 +69,7 @@ pub fn classify_hid_query(
 pub fn hid_query_may_target_crosspuck(vendor_id: u16, product_id: u16) -> bool {
     (vendor_id == 0 && product_id == 0)
         || (vendor_id == CROSSPUCK_VENDOR_ID
-            && (product_id == 0 || product_id == CROSSPUCK_PRODUCT_ID))
+            && (product_id == 0 || CROSSPUCK_KNOWN_PRODUCT_IDS.contains(&product_id)))
 }
 
 pub fn is_crosspuck_vid_pid(vendor_id: u16, product_id: u16, identity: &IdentityPayload) -> bool {
@@ -85,6 +89,14 @@ mod tests {
     fn classifies_only_crosspuck_vid_pid_paths_as_candidates() {
         assert_eq!(
             classify_device_path(r"\\?\hid#vid_28de&pid_1304&mi_02#serial"),
+            DevicePathRoute::CrossPuckCandidate
+        );
+        assert_eq!(
+            classify_device_path(r"\\?\hid#vid_28de&pid_1302&mi_00#serial"),
+            DevicePathRoute::CrossPuckCandidate
+        );
+        assert_eq!(
+            classify_device_path(r"\\?\hid#vid_28de&pid_1303&mi_00#serial"),
             DevicePathRoute::CrossPuckCandidate
         );
         assert_eq!(
@@ -146,6 +158,13 @@ mod tests {
         assert!(!hid_query_may_target_crosspuck(0, CROSSPUCK_PRODUCT_ID));
         assert!(!hid_query_may_target_crosspuck(0x045e, 0x0b13));
         assert!(!hid_query_may_target_crosspuck(0x046d, 0xc52b));
+    }
+
+    #[test]
+    fn prefilter_accepts_wired_and_bluetooth_product_ids() {
+        assert!(hid_query_may_target_crosspuck(CROSSPUCK_VENDOR_ID, 0x1302));
+        assert!(hid_query_may_target_crosspuck(CROSSPUCK_VENDOR_ID, 0x1303));
+        assert!(!hid_query_may_target_crosspuck(CROSSPUCK_VENDOR_ID, 0x1305));
     }
 
     #[test]

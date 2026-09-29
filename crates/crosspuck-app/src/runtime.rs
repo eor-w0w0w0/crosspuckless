@@ -2,7 +2,7 @@ use crate::hid_backend::{
     set_host_log_session_trace_id, HostBackend, HostHidError, RealHostBackend,
 };
 use crate::user_activity::UserActivityReporter;
-use crosspuck_core::hid::{snapshot_for_filter, HidFilter};
+use crosspuck_core::hid::{snapshot_for_any_known_mode, ConnectionMode};
 use crosspuck_core::protocol::{
     session_trace_label, Frame, FrameIoError, GetFeature, GuestRuntimeOverrides, Hello, HelloOk,
     IdentityPayload, InputAttach, InputAttachOk, InputReport, MessageType, ProtocolError,
@@ -33,12 +33,14 @@ pub enum HostRuntimeState {
     PuckDisconnected,
     PuckConnected {
         serial: String,
+        mode: ConnectionMode,
     },
     GuestConnected {
         session_id: u32,
         session_trace_id: u32,
         serial: String,
         guest_pid: u32,
+        mode: ConnectionMode,
     },
     Degraded {
         reason: String,
@@ -59,17 +61,21 @@ impl HostRuntimeState {
                 &format!("{control_addr}, {input_addr}"),
                 "-",
             ),
-            Self::PuckDisconnected => MenuView::new("Puck disconnected", "-", "-", "-"),
-            Self::PuckConnected { serial } => {
-                MenuView::new("Puck connected", serial.as_str(), "-", "-")
-            }
+            Self::PuckDisconnected => MenuView::new("Controller disconnected", "-", "-", "-"),
+            Self::PuckConnected { serial, mode } => MenuView::new(
+                &format!("{} connected", mode.label()),
+                serial.as_str(),
+                "-",
+                "-",
+            ),
             Self::GuestConnected {
                 session_id,
                 session_trace_id,
                 serial,
                 guest_pid,
+                mode,
             } => MenuView::new(
-                "Guest proxy connected",
+                &format!("Guest proxy connected ({})", mode.label()),
                 serial.as_str(),
                 &format!(
                     "pid={guest_pid}, session={}, id={session_id}",
@@ -283,11 +289,19 @@ fn run_accept_loop(
             stop,
         ) {
             Ok(()) => {}
-            Err(RuntimeError::DeviceUnavailable(_)) => {
+            Err(RuntimeError::DeviceUnavailable(reason)) => {
+                log::warn!(
+                    "CrossPuck[{}] session device unavailable: {reason}",
+                    session_trace_label(session_trace_id)
+                );
                 app_state.set(HostRuntimeState::PuckDisconnected);
             }
             Err(error) if stop.load(Ordering::Relaxed) && error.is_timeout() => {}
             Err(error) => {
+                log::warn!(
+                    "CrossPuck[{}] session failed: {error}",
+                    session_trace_label(session_trace_id)
+                );
                 app_state.set(HostRuntimeState::Degraded {
                     reason: format!("session failed: {error}"),
                 });
@@ -300,9 +314,10 @@ fn refresh_idle_puck_state(listeners: &TransportListeners, app_state: &AppState)
     if listeners.local_addrs().is_err() {
         return;
     }
-    match with_worker_autorelease_pool(|| snapshot_for_filter(&HidFilter::steam_puck())) {
-        Ok(snapshot) => app_state.set(HostRuntimeState::PuckConnected {
+    match with_worker_autorelease_pool(snapshot_for_any_known_mode) {
+        Ok((mode, snapshot)) => app_state.set(HostRuntimeState::PuckConnected {
             serial: snapshot.identity.serial,
+            mode,
         }),
         Err(_) => app_state.set(HostRuntimeState::PuckDisconnected),
     }
@@ -334,21 +349,20 @@ fn handle_session(
         ));
     }
 
-    let snapshot =
-        match with_worker_autorelease_pool(|| snapshot_for_filter(&HidFilter::steam_puck())) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                app_state.set(HostRuntimeState::PuckDisconnected);
-                let hello_ok = hello_ok_with_status(
-                    StatusCode::DeviceDisconnected,
-                    session_id,
-                    session_trace_id,
-                    0,
-                );
-                write_payload(control, hello_frame.header.id, &hello_ok)?;
-                return Err(RuntimeError::DeviceUnavailable(error.to_string()));
-            }
-        };
+    let (mode, snapshot) = match with_worker_autorelease_pool(snapshot_for_any_known_mode) {
+        Ok(found) => found,
+        Err(error) => {
+            app_state.set(HostRuntimeState::PuckDisconnected);
+            let hello_ok = hello_ok_with_status(
+                StatusCode::DeviceDisconnected,
+                session_id,
+                session_trace_id,
+                0,
+            );
+            write_payload(control, hello_frame.header.id, &hello_ok)?;
+            return Err(RuntimeError::DeviceUnavailable(error.to_string()));
+        }
+    };
     let identity = IdentityPayload::try_from(&snapshot)?;
     let session = SessionStart {
         session_id,
@@ -356,11 +370,13 @@ fn handle_session(
         guest_runtime_overrides,
         hello_request_id: hello_frame.header.id,
         guest_pid: hello.guest_pid,
+        mode,
     };
     app_state.set(HostRuntimeState::PuckConnected {
         serial: identity.serial.clone(),
+        mode,
     });
-    let backend = match with_worker_autorelease_pool(|| RealHostBackend::new(snapshot)) {
+    let backend = match with_worker_autorelease_pool(|| RealHostBackend::new(mode, snapshot)) {
         Ok(backend) => Arc::new(backend),
         Err(error) => {
             let hello_ok = hello_ok_with_status(
@@ -386,6 +402,7 @@ struct SessionStart {
     guest_runtime_overrides: GuestRuntimeOverrides,
     hello_request_id: u32,
     guest_pid: u32,
+    mode: ConnectionMode,
 }
 
 #[cfg(test)]
@@ -423,6 +440,7 @@ fn handle_session_with_backend_timeout(
 ) -> Result<(), RuntimeError> {
     app_state.set(HostRuntimeState::PuckConnected {
         serial: identity.serial.clone(),
+        mode: session.mode,
     });
 
     write_session_preamble(control, &session, &identity)?;
@@ -512,6 +530,7 @@ fn run_attached_session(
         session_trace_id: session.session_trace_id,
         serial: identity.serial.clone(),
         guest_pid: session.guest_pid,
+        mode: session.mode,
     });
     set_host_log_session_trace_id(Some(session.session_trace_id));
 
@@ -525,6 +544,7 @@ fn run_attached_session(
     set_host_log_session_trace_id(None);
     app_state.set(HostRuntimeState::PuckConnected {
         serial: identity.serial,
+        mode: session.mode,
     });
     control_result
 }
@@ -986,6 +1006,7 @@ mod tests {
                     },
                     hello_request_id: hello.header.id,
                     guest_pid: 1234,
+                    mode: ConnectionMode::Puck,
                 },
                 &AppState::new(),
                 test_identity(),
@@ -1072,6 +1093,7 @@ mod tests {
                         guest_runtime_overrides: GuestRuntimeOverrides::default(),
                         hello_request_id: hello.header.id,
                         guest_pid: 1234,
+                        mode: ConnectionMode::Puck,
                     },
                     &AppState::new(),
                     test_identity(),
@@ -1120,6 +1142,7 @@ mod tests {
                     guest_runtime_overrides: GuestRuntimeOverrides::default(),
                     hello_request_id: hello.header.id,
                     guest_pid: 1234,
+                    mode: ConnectionMode::Puck,
                 },
                 &AppState::new(),
                 test_identity(),
@@ -1182,6 +1205,7 @@ mod tests {
                     guest_runtime_overrides: GuestRuntimeOverrides::default(),
                     hello_request_id: hello.header.id,
                     guest_pid: 1234,
+                    mode: ConnectionMode::Puck,
                 },
                 &AppState::new(),
                 test_identity(),

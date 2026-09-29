@@ -7,10 +7,46 @@ use std::fmt;
 
 pub const VALVE_VENDOR_ID: u16 = 0x28DE;
 pub const STEAM_CONTROLLER_PUCK_PRODUCT_ID: u16 = 0x1304;
+pub const STEAM_CONTROLLER_WIRED_PRODUCT_ID: u16 = 0x1302;
+pub const STEAM_CONTROLLER_BLUETOOTH_PRODUCT_ID: u16 = 0x1303;
 pub const DEFAULT_INPUT_REPORT_LEN: u16 = 54;
 pub const DEFAULT_CONTROLLER_OUTPUT_REPORT_LEN: u16 = 64;
 pub const DEFAULT_DONGLE_OUTPUT_REPORT_LEN: u16 = 1;
 pub const DEFAULT_FEATURE_REPORT_LEN: u16 = 64;
+pub const DIRECT_INPUT_REPORT_LEN: u16 = 46;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionMode {
+    Puck,
+    WiredUsb,
+    Bluetooth,
+}
+
+impl ConnectionMode {
+    pub const PRIORITY: [Self; 3] = [Self::Puck, Self::WiredUsb, Self::Bluetooth];
+
+    pub fn product_id(self) -> u16 {
+        match self {
+            Self::Puck => STEAM_CONTROLLER_PUCK_PRODUCT_ID,
+            Self::WiredUsb => STEAM_CONTROLLER_WIRED_PRODUCT_ID,
+            Self::Bluetooth => STEAM_CONTROLLER_BLUETOOTH_PRODUCT_ID,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Puck => "Puck",
+            Self::WiredUsb => "Wired USB",
+            Self::Bluetooth => "Bluetooth",
+        }
+    }
+
+    pub fn from_product_id(product_id: u16) -> Option<Self> {
+        Self::PRIORITY
+            .into_iter()
+            .find(|mode| mode.product_id() == product_id)
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct HidFilter {
@@ -21,9 +57,13 @@ pub struct HidFilter {
 
 impl HidFilter {
     pub fn steam_puck() -> Self {
+        Self::steam_controller(ConnectionMode::Puck)
+    }
+
+    pub fn steam_controller(mode: ConnectionMode) -> Self {
         Self {
             vendor_id: Some(VALVE_VENDOR_ID),
-            product_id: Some(STEAM_CONTROLLER_PUCK_PRODUCT_ID),
+            product_id: Some(mode.product_id()),
             serial: None,
         }
     }
@@ -238,12 +278,10 @@ pub fn build_puck_snapshot(
     let identity_source = candidates
         .iter()
         .find(|candidate| {
-            candidate.vendor_id == VALVE_VENDOR_ID
-                && candidate.product_id == STEAM_CONTROLLER_PUCK_PRODUCT_ID
-                && candidate
-                    .serial
-                    .as_deref()
-                    .is_some_and(|serial| !serial.is_empty())
+            candidate
+                .serial
+                .as_deref()
+                .is_some_and(|serial| !serial.is_empty())
         })
         .or_else(|| candidates.first())
         .ok_or(HidSnapshotError::NoMatchingDevice)?;
@@ -265,7 +303,7 @@ pub fn build_puck_snapshot(
         product: identity_source
             .product
             .clone()
-            .unwrap_or_else(|| "Steam Controller Puck".to_string()),
+            .unwrap_or_else(|| "Steam Controller".to_string()),
         serial,
     };
 
@@ -302,13 +340,48 @@ pub fn snapshot_for_filter(filter: &HidFilter) -> Result<PuckSnapshot, HidSnapsh
     build_puck_snapshot(&candidates)
 }
 
+pub fn snapshot_for_any_known_mode() -> Result<(ConnectionMode, PuckSnapshot), HidSnapshotError> {
+    let api = HidApi::new()?;
+    let vendor_filter = HidFilter {
+        vendor_id: Some(VALVE_VENDOR_ID),
+        product_id: None,
+        serial: None,
+    };
+    let candidates = collect_candidates(&api, &vendor_filter);
+
+    let mut last_error = None;
+    for mode in ConnectionMode::PRIORITY {
+        let mode_candidates: Vec<DeviceCandidate> = candidates
+            .iter()
+            .filter(|candidate| candidate.product_id == mode.product_id())
+            .cloned()
+            .collect();
+        if mode_candidates.is_empty() {
+            continue;
+        }
+        match build_puck_snapshot(&mode_candidates) {
+            Ok(snapshot) => return Ok((mode, snapshot)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or(HidSnapshotError::NoMatchingDevice))
+}
+
 fn collection_info(candidate: &DeviceCandidate) -> Option<HidCollectionInfo> {
     let role = role_for_candidate(candidate)?;
-    let (output_report_len, feature_report_len) = match role {
-        HidCollectionRole::PuckVendorDongle => {
-            (DEFAULT_DONGLE_OUTPUT_REPORT_LEN, DEFAULT_FEATURE_REPORT_LEN)
-        }
+    let (input_report_len, output_report_len, feature_report_len) = match role {
+        HidCollectionRole::PuckVendorDongle => (
+            DEFAULT_INPUT_REPORT_LEN,
+            DEFAULT_DONGLE_OUTPUT_REPORT_LEN,
+            DEFAULT_FEATURE_REPORT_LEN,
+        ),
+        _ if is_direct_product(candidate.product_id) => (
+            DIRECT_INPUT_REPORT_LEN,
+            DEFAULT_CONTROLLER_OUTPUT_REPORT_LEN,
+            DEFAULT_FEATURE_REPORT_LEN,
+        ),
         _ => (
+            DEFAULT_INPUT_REPORT_LEN,
             DEFAULT_CONTROLLER_OUTPUT_REPORT_LEN,
             DEFAULT_FEATURE_REPORT_LEN,
         ),
@@ -316,17 +389,31 @@ fn collection_info(candidate: &DeviceCandidate) -> Option<HidCollectionInfo> {
 
     Some(HidCollectionInfo {
         role,
-        interface_number: candidate.interface_number,
+        interface_number: candidate.interface_number.max(0),
         usage_page: candidate.usage_page,
         usage: candidate.usage,
-        input_report_len: DEFAULT_INPUT_REPORT_LEN,
+        input_report_len,
         output_report_len,
         feature_report_len,
         path: candidate.path.clone(),
     })
 }
 
+fn is_direct_product(product_id: u16) -> bool {
+    matches!(
+        product_id,
+        STEAM_CONTROLLER_WIRED_PRODUCT_ID | STEAM_CONTROLLER_BLUETOOTH_PRODUCT_ID
+    )
+}
+
 fn role_for_candidate(candidate: &DeviceCandidate) -> Option<HidCollectionRole> {
+    if is_direct_product(candidate.product_id) {
+        return role_for_direct_candidate(candidate);
+    }
+    role_for_puck_candidate(candidate)
+}
+
+fn role_for_puck_candidate(candidate: &DeviceCandidate) -> Option<HidCollectionRole> {
     match (
         candidate.interface_number,
         candidate.usage_page,
@@ -343,15 +430,36 @@ fn role_for_candidate(candidate: &DeviceCandidate) -> Option<HidCollectionRole> 
     }
 }
 
+fn role_for_direct_candidate(candidate: &DeviceCandidate) -> Option<HidCollectionRole> {
+    match (candidate.usage_page, candidate.usage) {
+        (0xFF00, 0x0001) => Some(HidCollectionRole::PuckMain),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn candidate(interface_number: i32, usage_page: u16, usage: u16) -> DeviceCandidate {
+        candidate_for_product(
+            STEAM_CONTROLLER_PUCK_PRODUCT_ID,
+            interface_number,
+            usage_page,
+            usage,
+        )
+    }
+
+    fn candidate_for_product(
+        product_id: u16,
+        interface_number: i32,
+        usage_page: u16,
+        usage: u16,
+    ) -> DeviceCandidate {
         DeviceCandidate {
             path: format!("test-interface-{interface_number}-{usage_page:04x}-{usage:04x}"),
             vendor_id: VALVE_VENDOR_ID,
-            product_id: STEAM_CONTROLLER_PUCK_PRODUCT_ID,
+            product_id,
             version_number: 2,
             interface_number,
             usage_page,
@@ -376,5 +484,88 @@ mod tests {
             role_for_candidate(&candidate(6, 0xFF00, 0x0002)),
             Some(HidCollectionRole::PuckVendorDongle)
         );
+    }
+
+    #[test]
+    fn connection_mode_priority_is_puck_then_wired_then_bluetooth() {
+        assert_eq!(
+            ConnectionMode::PRIORITY,
+            [
+                ConnectionMode::Puck,
+                ConnectionMode::WiredUsb,
+                ConnectionMode::Bluetooth
+            ]
+        );
+        assert_eq!(
+            ConnectionMode::from_product_id(STEAM_CONTROLLER_WIRED_PRODUCT_ID),
+            Some(ConnectionMode::WiredUsb)
+        );
+        assert_eq!(
+            ConnectionMode::from_product_id(STEAM_CONTROLLER_BLUETOOTH_PRODUCT_ID),
+            Some(ConnectionMode::Bluetooth)
+        );
+        assert_eq!(ConnectionMode::from_product_id(0x0000), None);
+    }
+
+    #[test]
+    fn maps_wired_vendor_collection_to_puck_main_and_ignores_lizard_mode_collections() {
+        assert_eq!(
+            role_for_candidate(&candidate_for_product(
+                STEAM_CONTROLLER_WIRED_PRODUCT_ID,
+                0,
+                0xFF00,
+                0x0001
+            )),
+            Some(HidCollectionRole::PuckMain)
+        );
+        assert_eq!(
+            role_for_candidate(&candidate_for_product(
+                STEAM_CONTROLLER_WIRED_PRODUCT_ID,
+                0,
+                0x0001,
+                0x0002
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn maps_bluetooth_vendor_collection_with_no_interface_number() {
+        assert_eq!(
+            role_for_candidate(&candidate_for_product(
+                STEAM_CONTROLLER_BLUETOOTH_PRODUCT_ID,
+                -1,
+                0xFF00,
+                0x0001
+            )),
+            Some(HidCollectionRole::PuckMain)
+        );
+    }
+
+    #[test]
+    fn direct_connections_use_measured_input_report_length() {
+        let wired = collection_info(&candidate_for_product(
+            STEAM_CONTROLLER_WIRED_PRODUCT_ID,
+            0,
+            0xFF00,
+            0x0001,
+        ))
+        .unwrap();
+        assert_eq!(wired.input_report_len, DIRECT_INPUT_REPORT_LEN);
+
+        let puck = collection_info(&candidate(2, 0xFF00, 0x0001)).unwrap();
+        assert_eq!(puck.input_report_len, DEFAULT_INPUT_REPORT_LEN);
+    }
+
+    #[test]
+    fn bluetooth_negative_interface_number_normalizes_to_zero_for_wire_protocol() {
+        let info = collection_info(&candidate_for_product(
+            STEAM_CONTROLLER_BLUETOOTH_PRODUCT_ID,
+            -1,
+            0xFF00,
+            0x0001,
+        ))
+        .unwrap();
+        assert_eq!(info.interface_number, 0);
     }
 }
