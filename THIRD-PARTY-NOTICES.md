@@ -1,13 +1,21 @@
 # Third-Party Notices
 
-This file records the declared licenses of third-party Rust dependencies used
-by CrossPuck.
+This file records the declared licenses of third-party components used by
+CrossPuck.
 
 The dependency list was generated from `cargo metadata --locked` on
 2026-05-25. All currently declared dependency licenses are permissive; no
 copyleft dependency was found.
 
 For binary releases, distribute this file together with `LICENSE`.
+
+## Sparkle
+
+CrossPuck bundles [Sparkle 2.10.0](https://github.com/sparkle-project/Sparkle)
+for macOS in-app updates. Sparkle is MIT licensed and includes components
+under BSD, MIT, and zlib licenses. The complete upstream copyright and
+license notices, including its bundled components, are distributed in the
+app's `Contents/Resources/Sparkle-LICENSE.txt`.
 
 ## Rust Dependencies
 

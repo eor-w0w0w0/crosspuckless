@@ -36,6 +36,8 @@ mod runtime;
 #[cfg(target_os = "macos")]
 mod settings;
 #[cfg(target_os = "macos")]
+mod updates;
+#[cfg(target_os = "macos")]
 mod user_activity;
 
 #[cfg(target_os = "macos")]
@@ -58,18 +60,20 @@ mod macos {
     use crate::runtime::{
         start_host_service_with_config, AppState, HostServiceConfig, HostServiceHandle,
     };
+    use crate::updates::UpdateMenuController;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, ProtocolObject};
     use objc2::{
         define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
     };
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSImage, NSImageScaling,
-        NSMenu, NSMenuDelegate, NSMenuItem, NSModalResponseOK, NSOpenPanel,
-        NSSquareStatusItemLength, NSStatusBar, NSStatusItem,
+        NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSCellImagePosition,
+        NSImage, NSImageScaling, NSMenu, NSMenuDelegate, NSMenuItem, NSModalResponseOK,
+        NSOpenPanel, NSSquareStatusItemLength, NSStatusBar, NSStatusItem,
     };
     use objc2_foundation::{
-        NSAutoreleasePool, NSBundle, NSObject, NSObjectProtocol, NSString, NSTimer, NSURL,
+        NSAutoreleasePool, NSBundle, NSNotification, NSObject, NSObjectProtocol, NSString, NSTimer,
+        NSURL,
     };
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
@@ -86,6 +90,8 @@ mod macos {
         _driver_controller: Retained<DriverInstallController>,
         _bottle_controller: Retained<BottleController>,
         _quit_controller: Retained<QuitController>,
+        _updates: Retained<UpdateMenuController>,
+        _app_delegate: Retained<AppDelegate>,
     }
 
     #[derive(Clone)]
@@ -107,6 +113,7 @@ mod macos {
         app_state: AppState,
         driver_state: Arc<DriverMenuState>,
         items: StateMenuItems,
+        updates: Retained<UpdateMenuController>,
     }
 
     define_class!(
@@ -122,6 +129,7 @@ mod macos {
             fn menu_will_open(&self, _menu: &NSMenu) {
                 crate::probe::note_menu_will_open();
                 let refresh = || {
+                    self.ivars().updates.refresh();
                     self.ivars().driver_state.refresh_status();
                     refresh_state_items(
                         &self.ivars().app_state,
@@ -138,6 +146,7 @@ mod macos {
             fn refresh_timer(&self, _timer: &NSTimer) {
                 crate::probe::note_ui_timer_tick();
                 let refresh = || {
+                    self.ivars().updates.refresh();
                     refresh_state_items(
                         &self.ivars().app_state,
                         &self.ivars().driver_state,
@@ -155,11 +164,13 @@ mod macos {
             app_state: AppState,
             driver_state: Arc<DriverMenuState>,
             items: StateMenuItems,
+            updates: Retained<UpdateMenuController>,
         ) -> Retained<Self> {
             let this = Self::alloc(mtm).set_ivars(StateMenuDelegateIvars {
                 app_state,
                 driver_state,
                 items,
+                updates,
             });
             unsafe { msg_send![super(this), init] }
         }
@@ -307,7 +318,6 @@ mod macos {
 
     struct QuitControllerIvars {
         app: Retained<NSApplication>,
-        service_handle: HostServiceHandle,
     }
 
     define_class!(
@@ -321,22 +331,43 @@ mod macos {
         impl QuitController {
             #[unsafe(method(quit:))]
             fn quit(&self, sender: Option<&AnyObject>) {
-                self.ivars().service_handle.shutdown();
                 self.ivars().app.terminate(sender);
             }
         }
     );
 
     impl QuitController {
-        fn new(
-            mtm: MainThreadMarker,
-            app: Retained<NSApplication>,
-            service_handle: HostServiceHandle,
-        ) -> Retained<Self> {
-            let this = Self::alloc(mtm).set_ivars(QuitControllerIvars {
-                app,
-                service_handle,
-            });
+        fn new(mtm: MainThreadMarker, app: Retained<NSApplication>) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(QuitControllerIvars { app });
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    struct AppDelegateIvars {
+        service_handle: HostServiceHandle,
+    }
+
+    define_class!(
+        #[unsafe(super = NSObject)]
+        #[thread_kind = objc2::MainThreadOnly]
+        #[ivars = AppDelegateIvars]
+        struct AppDelegate;
+
+        unsafe impl NSObjectProtocol for AppDelegate {}
+
+        unsafe impl NSApplicationDelegate for AppDelegate {
+            #[unsafe(method(applicationWillTerminate:))]
+            fn application_will_terminate(&self, _notification: &NSNotification) {
+                // NSApplication reaches this for both the Quit menu and Sparkle's
+                // install/relaunch path. Give HID/IPC cleanup a bounded wait.
+                self.ivars().service_handle.shutdown();
+            }
+        }
+    );
+
+    impl AppDelegate {
+        fn new(mtm: MainThreadMarker, service_handle: HostServiceHandle) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(AppDelegateIvars { service_handle });
             unsafe { msg_send![super(this), init] }
         }
     }
@@ -365,9 +396,10 @@ mod macos {
             );
             log::info!("CrossPuck host app started");
             let menu_objects = build_menu_bar(app.clone(), mtm, &app_state, service_handle);
-            Box::leak(Box::new(menu_objects));
-
             app.run();
+            menu_objects._refresh_timer.invalidate();
+            menu_objects._app_delegate.ivars().service_handle.shutdown();
+            app.setDelegate(None);
         }
 
         log::info!("CrossPuck host app stopped");
@@ -501,15 +533,19 @@ mod macos {
         state_items
             .bottle_choose
             .setTarget(Some(bottle_controller.as_ref()));
+
         state_items
             .bottle_reset
             .setTarget(Some(bottle_controller.as_ref()));
+
+        let updates = UpdateMenuController::new(mtm, &menu);
 
         let menu_delegate = StateMenuDelegate::new(
             mtm,
             app_state.clone(),
             Arc::clone(&driver_state),
             state_items.clone(),
+            updates.clone(),
         );
         menu.setDelegate(Some(ProtocolObject::from_ref(&*menu_delegate)));
         refresh_state_items(app_state, &driver_state, &state_items);
@@ -525,7 +561,9 @@ mod macos {
         let separator = NSMenuItem::separatorItem(mtm);
         menu.addItem(&separator);
 
-        let quit_controller = QuitController::new(mtm, app.clone(), service_handle);
+        let app_delegate = AppDelegate::new(mtm, service_handle);
+        app.setDelegate(Some(ProtocolObject::from_ref(&*app_delegate)));
+        let quit_controller = QuitController::new(mtm, app.clone());
         let quit_title = NSString::from_str("Quit");
         let quit_key = NSString::from_str("q");
         let quit_item =
@@ -544,6 +582,8 @@ mod macos {
             _driver_controller: driver_controller,
             _bottle_controller: bottle_controller,
             _quit_controller: quit_controller,
+            _updates: updates,
+            _app_delegate: app_delegate,
         }
     }
 

@@ -45,6 +45,8 @@ objc2-app-kit = { workspace = true, features = [
 objc2-foundation = { workspace = true, features = [
     "NSDate",
     "NSBundle",
+    "NSError",
+    "NSNotification",
     "NSAutoreleasePool",
     "NSObject",
     "NSString",
