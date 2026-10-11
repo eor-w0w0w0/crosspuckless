@@ -1,3 +1,6 @@
+#[cfg(any(windows, test))]
+mod connectivity;
+
 #[cfg(windows)]
 mod windows;
 
