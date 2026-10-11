@@ -6,6 +6,7 @@ use super::profile::{VirtualHidProfile, VirtualHidProfileCatalog};
 use super::trace::TraceLimiter;
 use crate::protocol::{GuestRuntimeOverrides, LogSeverity};
 use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,7 @@ pub struct GuestDriverRuntime {
     handles: Mutex<VirtualHandleTable>,
     last_connect_attempt: Mutex<Option<Instant>>,
     trace_limiter: Mutex<TraceLimiter>,
+    device_generation: AtomicU32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +54,7 @@ impl GuestDriverRuntime {
             handles: Mutex::new(VirtualHandleTable::default()),
             last_connect_attempt: Mutex::new(None),
             trace_limiter: Mutex::new(trace_limiter),
+            device_generation: AtomicU32::new(0),
         }
     }
 
@@ -196,14 +199,22 @@ impl GuestDriverRuntime {
             .bridge
             .lock()
             .map_err(|_| GuestDriverError::StatePoisoned("bridge"))? = Some(bridge);
+        self.device_generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     pub fn clear_bridge(&self, _reason: &'static str) {
         let removed_bridge = self.bridge.lock().ok().and_then(|mut bridge| bridge.take());
+        if removed_bridge.is_some() {
+            self.device_generation.fetch_add(1, Ordering::Relaxed);
+        }
         drop(removed_bridge);
         self.reset_trace_limiter();
         self.mark_bridge_stale();
+    }
+
+    pub fn device_generation(&self) -> u32 {
+        self.device_generation.load(Ordering::Relaxed)
     }
 
     fn clear_bridge_if_current(&self, current_bridge: &Arc<HostBridge>, _reason: &'static str) {
@@ -218,6 +229,7 @@ impl GuestDriverRuntime {
             }
         });
         if removed_bridge.is_some() {
+            self.device_generation.fetch_add(1, Ordering::Relaxed);
             drop(removed_bridge);
             self.reset_trace_limiter();
             self.mark_bridge_stale();
@@ -616,6 +628,7 @@ mod tests {
         runtime.clear_bridge("test");
 
         assert!(runtime.catalog().is_none());
+        assert_eq!(runtime.device_generation(), 0);
         assert!(!runtime.can_advertise());
     }
 
@@ -795,6 +808,7 @@ mod tests {
         });
         runtime.connect_bridge().unwrap();
 
+        assert_eq!(runtime.device_generation(), 1);
         assert_eq!(
             runtime.operation_timeout_ms(DEFAULT_GET_FEATURE_TIMEOUT),
             75
@@ -807,6 +821,7 @@ mod tests {
 
         runtime.clear_bridge("test");
 
+        assert_eq!(runtime.device_generation(), 2);
         assert_eq!(
             runtime.operation_timeout_ms(DEFAULT_GET_FEATURE_TIMEOUT),
             100

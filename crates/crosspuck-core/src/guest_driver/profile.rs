@@ -305,23 +305,26 @@ impl VirtualHidProfileCatalog {
     }
 
     fn profile_for_lenient_identity_path(&self, lower_path: &str) -> Option<VirtualHidProfile> {
-        let profile = if lower_path.contains("vid_28de&pid_1304&mi_06")
-            || (lower_path.contains("vid_28de&pid_1304") && lower_path.contains("col02"))
-        {
-            VirtualHidProfile::VendorDongle
-        } else if lower_path.contains("vid_28de&pid_1304&mi_03") {
-            VirtualHidProfile::Interface3
-        } else if lower_path.contains("vid_28de&pid_1304&mi_04") {
-            VirtualHidProfile::Interface4
-        } else if lower_path.contains("vid_28de&pid_1304&mi_05") {
-            VirtualHidProfile::Interface5
-        } else if lower_path.contains("vid_28de&pid_1304&mi_02")
-            || lower_path.contains("vid_28de&pid_1304")
-        {
-            VirtualHidProfile::Main
-        } else {
+        let vid_pid = format!(
+            "vid_{:04x}&pid_{:04x}",
+            self.identity.vendor_id, self.identity.product_id
+        );
+        if !lower_path.contains(&vid_pid) {
             return None;
-        };
+        }
+
+        let profile =
+            if lower_path.contains(&format!("{vid_pid}&mi_06")) || lower_path.contains("col02") {
+                VirtualHidProfile::VendorDongle
+            } else if lower_path.contains(&format!("{vid_pid}&mi_03")) {
+                VirtualHidProfile::Interface3
+            } else if lower_path.contains(&format!("{vid_pid}&mi_04")) {
+                VirtualHidProfile::Interface4
+            } else if lower_path.contains(&format!("{vid_pid}&mi_05")) {
+                VirtualHidProfile::Interface5
+            } else {
+                VirtualHidProfile::Main
+            };
 
         self.descriptor(profile)
             .map(|descriptor| descriptor.profile)
@@ -399,6 +402,25 @@ mod tests {
         assert_eq!(
             catalog.profile_for_path(r"\\?\hid#vid_28de&pid_1304#serial"),
             Some(VirtualHidProfile::Main)
+        );
+    }
+
+    #[test]
+    fn lenient_path_uses_live_identity_vid_pid_not_a_hardcoded_puck_pid() {
+        let mut identity = default_fallback_identity();
+        identity.product_id = 0x1302;
+        identity
+            .collections
+            .retain(|collection| collection.role == CollectionRole::PuckMain);
+        let catalog = VirtualHidProfileCatalog::from_identity(&identity, false);
+
+        assert_eq!(
+            catalog.profile_for_path(r"\\?\hid#vid_28de&pid_1302#serial"),
+            Some(VirtualHidProfile::Main)
+        );
+        assert_eq!(
+            catalog.profile_for_path(r"\\?\hid#vid_28de&pid_1304#serial"),
+            None
         );
     }
 

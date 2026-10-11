@@ -6,6 +6,7 @@ root_dir="$(cd "$(dirname "$0")/.." && pwd)"
 driver_target="x86_64-pc-windows-gnu"
 driver_profile="release"
 app_features="${CROSSPUCK_APP_FEATURES:-}"
+app_sign_identity="${CROSSPUCK_APP_SIGN_IDENTITY:-}"
 
 ensure_driver_target_installed() {
   if ! command -v rustup >/dev/null 2>&1; then
@@ -135,5 +136,10 @@ cat > "$guest_driver_dir/manifest.json" <<EOF
   "size": $driver_size
 }
 EOF
+
+if [ -n "$app_sign_identity" ]; then
+  codesign --force --sign "$app_sign_identity" "$app_dir" >&2
+  codesign --verify --strict "$app_dir" >&2
+fi
 
 echo "$app_dir"

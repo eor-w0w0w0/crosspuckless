@@ -155,6 +155,12 @@ fn install_sdl_hidapi_hooks() {
     );
     install_optional_hook(
         "SDL3.dll",
+        "SDL_hid_device_change_count",
+        sdl::detoured_sdl_hid_device_change_count as *mut c_void,
+        sdl::set_original_sdl_hid_device_change_count,
+    );
+    install_optional_hook(
+        "SDL3.dll",
         "SDL_hid_enumerate",
         sdl::detoured_sdl_hid_enumerate as *mut c_void,
         sdl::set_original_sdl_hid_enumerate,
