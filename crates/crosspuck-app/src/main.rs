@@ -52,8 +52,9 @@ fn main() -> ExitCode {
 #[cfg(target_os = "macos")]
 mod macos {
     use crate::driver_install::{
-        check_driver_install_status, install_driver, uninstall_driver, DriverInstallContext,
-        DriverInstallState, DriverInstallStatus,
+        check_driver_install_status, duplicate_xinput_hidden, install_driver,
+        set_duplicate_xinput_hidden, uninstall_driver, DriverInstallContext, DriverInstallState,
+        DriverInstallStatus,
     };
     use crate::runtime::{
         start_host_service_with_config, AppState, HostServiceConfig, HostServiceHandle,
@@ -64,9 +65,9 @@ mod macos {
         define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
     };
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSImage, NSImageScaling,
-        NSMenu, NSMenuDelegate, NSMenuItem, NSModalResponseOK, NSOpenPanel,
-        NSSquareStatusItemLength, NSStatusBar, NSStatusItem,
+        NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSControlStateValueOff,
+        NSControlStateValueOn, NSImage, NSImageScaling, NSMenu, NSMenuDelegate, NSMenuItem,
+        NSModalResponseOK, NSOpenPanel, NSSquareStatusItemLength, NSStatusBar, NSStatusItem,
     };
     use objc2_foundation::{
         NSAutoreleasePool, NSBundle, NSObject, NSObjectProtocol, NSString, NSTimer, NSURL,
@@ -101,6 +102,7 @@ mod macos {
         bottle_info: Retained<NSMenuItem>,
         bottle_choose: Retained<NSMenuItem>,
         bottle_reset: Retained<NSMenuItem>,
+        duplicate_xinput: Retained<NSMenuItem>,
     }
 
     #[derive(Clone)]
@@ -126,6 +128,10 @@ mod macos {
                     self.ivars().driver_state.refresh_status();
                     refresh_state_items(
                         &self.ivars().app_state,
+                        &self.ivars().driver_state,
+                        &self.ivars().items,
+                    );
+                    refresh_duplicate_xinput_item(
                         &self.ivars().driver_state,
                         &self.ivars().items,
                     );
@@ -281,6 +287,25 @@ mod macos {
                 crate::settings::clear_stored_bottle_path();
                 self.apply_bottle_path_change();
             }
+
+            #[unsafe(method(toggleDuplicateXInput:))]
+            fn toggle_duplicate_xinput(&self, _sender: Option<&AnyObject>) {
+                let driver_state = &self.ivars().driver_state;
+                let Some(bottle) = active_bottle(driver_state) else {
+                    return;
+                };
+                let hidden = !duplicate_xinput_hidden(&bottle);
+                match set_duplicate_xinput_hidden(&bottle, hidden) {
+                    Ok(()) => log::info!(
+                        "CrossPuck duplicate XInput controller hidden={hidden} bottle={}",
+                        bottle.display()
+                    ),
+                    Err(error) => {
+                        log::error!("CrossPuck failed to update bottle environment: {error}")
+                    }
+                }
+                refresh_duplicate_xinput_item(driver_state, &self.ivars().items);
+            }
         }
     );
 
@@ -303,6 +328,7 @@ mod macos {
             driver_state.refresh_status();
             refresh_driver_items(driver_state, &self.ivars().items);
             refresh_bottle_items(driver_state, &self.ivars().items);
+            refresh_duplicate_xinput_item(driver_state, &self.ivars().items);
         }
     }
 
@@ -434,6 +460,17 @@ mod macos {
         let empty_key = NSString::from_str("");
         let bottle_menu = NSMenu::new(mtm);
         bottle_menu.setAutoenablesItems(false);
+
+        // Advanced > Bottle Path > (bottle items)
+        let advanced_menu = NSMenu::new(mtm);
+        advanced_menu.setAutoenablesItems(false);
+        let bottle_path_item = advanced_menu.addItemWithTitle_action_keyEquivalent(
+            &NSString::from_str("Bottle Path"),
+            None,
+            &empty_key,
+        );
+        bottle_path_item.setSubmenu(Some(&bottle_menu));
+
         let state_items = StateMenuItems {
             status: menu.addItemWithTitle_action_keyEquivalent(
                 &NSString::from_str("Status: Starting"),
@@ -489,6 +526,11 @@ mod macos {
                 Some(sel!(resetBottle:)),
                 &empty_key,
             ),
+            duplicate_xinput: advanced_menu.addItemWithTitle_action_keyEquivalent(
+                &NSString::from_str("Hide Duplicate XInput Controller"),
+                Some(sel!(toggleDuplicateXInput:)),
+                &empty_key,
+            ),
         };
         state_items.status.setEnabled(false);
         state_items.puck.setEnabled(false);
@@ -496,18 +538,14 @@ mod macos {
         state_items.error.setEnabled(false);
         state_items.driver_status.setEnabled(false);
         state_items.bottle_info.setEnabled(false);
+        state_items
+            .duplicate_xinput
+            .setToolTip(Some(&NSString::from_str(
+                "Stop Wine from also exposing the controller as an XInput device in this bottle. Takes effect after restarting the bottle.",
+            )));
 
-        // Advanced > Bottle Path > (bottle items)
         let separator = NSMenuItem::separatorItem(mtm);
         menu.addItem(&separator);
-        let advanced_menu = NSMenu::new(mtm);
-        advanced_menu.setAutoenablesItems(false);
-        let bottle_path_item = advanced_menu.addItemWithTitle_action_keyEquivalent(
-            &NSString::from_str("Bottle Path"),
-            None,
-            &empty_key,
-        );
-        bottle_path_item.setSubmenu(Some(&bottle_menu));
         let reconnect_item = advanced_menu.addItemWithTitle_action_keyEquivalent(
             &NSString::from_str("Force Reconnect"),
             Some(sel!(forceReconnect:)),
@@ -537,6 +575,9 @@ mod macos {
         state_items
             .bottle_reset
             .setTarget(Some(bottle_controller.as_ref()));
+        state_items
+            .duplicate_xinput
+            .setTarget(Some(bottle_controller.as_ref()));
 
         let reconnect_controller = ReconnectController::new(mtm, app_state.clone());
         reconnect_item.setTarget(Some(reconnect_controller.as_ref()));
@@ -549,6 +590,7 @@ mod macos {
         );
         menu.setDelegate(Some(ProtocolObject::from_ref(&*menu_delegate)));
         refresh_state_items(app_state, &driver_state, &state_items);
+        refresh_duplicate_xinput_item(&driver_state, &state_items);
         let refresh_timer =
             NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 0.5,
@@ -632,6 +674,24 @@ mod macos {
         items
             .bottle_reset
             .setEnabled(!env_override && crate::settings::stored_bottle_path().is_some());
+    }
+
+    fn refresh_duplicate_xinput_item(driver_state: &DriverMenuState, items: &StateMenuItems) {
+        let bottle = active_bottle(driver_state);
+        items.duplicate_xinput.setEnabled(bottle.is_some());
+        let state = if bottle.as_deref().is_some_and(duplicate_xinput_hidden) {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        };
+        items.duplicate_xinput.setState(state);
+    }
+
+    fn active_bottle(driver_state: &DriverMenuState) -> Option<PathBuf> {
+        driver_state
+            .current_context()
+            .bottle_path
+            .or_else(|| driver_state.discovered_bottle())
     }
 
     fn display_path(path: &Path) -> String {
