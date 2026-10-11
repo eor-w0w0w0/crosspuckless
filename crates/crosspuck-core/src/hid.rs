@@ -372,6 +372,56 @@ pub fn build_snapshot_for_known_modes(
     Err(last_error.unwrap_or(HidSnapshotError::NoMatchingDevice))
 }
 
+/// Session candidates require a usable main collection. Keep diagnostic snapshots
+/// permissive: a dongle-only snapshot can still be useful to inspection tools.
+pub fn build_session_snapshots(
+    candidates: &[DeviceCandidate],
+) -> Vec<(ConnectionMode, PuckSnapshot)> {
+    ConnectionMode::PRIORITY
+        .into_iter()
+        .filter_map(|mode| {
+            let candidates: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.vendor_id == VALVE_VENDOR_ID
+                        && candidate.product_id == mode.product_id()
+                })
+                .cloned()
+                .collect();
+            let snapshot = build_puck_snapshot(&candidates).ok()?;
+            snapshot
+                .collections
+                .iter()
+                .any(|collection| {
+                    collection.role == HidCollectionRole::PuckMain
+                        && u8::try_from(collection.interface_number).is_ok()
+                })
+                .then_some((mode, snapshot))
+        })
+        .collect()
+}
+
+/// Enumerate once without opening HID handles. Backend readiness is checked by
+/// the session starter, never by the idle UI refresh.
+pub fn session_snapshots_for_known_modes(
+) -> Result<Vec<(ConnectionMode, PuckSnapshot)>, HidSnapshotError> {
+    let api = HidApi::new()?;
+    let candidates = collect_candidates(
+        &api,
+        &HidFilter {
+            vendor_id: Some(VALVE_VENDOR_ID),
+            product_id: None,
+            serial: None,
+        },
+    );
+    let snapshots = build_session_snapshots(&candidates);
+    if snapshots.is_empty() {
+        Err(HidSnapshotError::MissingCollections)
+    } else {
+        Ok(snapshots)
+    }
+}
+
 fn collection_info(candidate: &DeviceCandidate) -> Option<HidCollectionInfo> {
     let role = role_for_candidate(candidate)?;
     let (input_report_len, output_report_len, feature_report_len) = match role {
@@ -510,6 +560,36 @@ mod tests {
             Some(ConnectionMode::Bluetooth)
         );
         assert_eq!(ConnectionMode::from_product_id(0x0000), None);
+    }
+
+    #[test]
+    fn session_validation_preserves_permissive_diagnostic_snapshots() {
+        let dongle = vec![candidate(6, 0xff00, 2)];
+        assert_eq!(
+            build_snapshot_for_known_modes(&dongle).unwrap().0,
+            ConnectionMode::Puck
+        );
+        assert!(build_session_snapshots(&dongle).is_empty());
+        let complete = vec![candidate(2, 0xff00, 1), candidate(3, 0xff00, 1)];
+        let snapshots = build_session_snapshots(&complete);
+        assert_eq!(snapshots[0].1.collections.len(), 2);
+    }
+
+    #[test]
+    fn session_selection_skips_dongle_only_puck() {
+        let candidates = vec![
+            candidate(6, 0xFF00, 0x0002),
+            candidate_for_product(STEAM_CONTROLLER_WIRED_PRODUCT_ID, 0, 0xFF00, 0x0001),
+        ];
+        let (mode, snapshot) = build_session_snapshots(&candidates)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(mode, ConnectionMode::WiredUsb);
+        assert!(snapshot
+            .collections
+            .iter()
+            .any(|c| c.role == HidCollectionRole::PuckMain));
     }
 
     #[test]

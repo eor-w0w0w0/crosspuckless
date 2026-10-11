@@ -851,9 +851,11 @@ impl CollectionInputReader {
                             self.consecutive_errors = 0;
                         }
                         Err(refresh_error)
-                            if refresh_error.is_no_matching_device()
-                                && now.duration_since(first_error_at)
-                                    >= INPUT_DEVICE_GONE_GRACE =>
+                            if missing_device_grace_elapsed(
+                                &refresh_error,
+                                first_error_at,
+                                now,
+                            ) =>
                         {
                             warn_host_guest_event!(
                                 "HID input device gone: interface={} role={:?} path={}",
@@ -937,6 +939,14 @@ impl CollectionInputReader {
             .map(|path| path.clone())
             .unwrap_or_else(|_| "<poisoned>".to_string())
     }
+}
+
+fn missing_device_grace_elapsed(
+    error: &HostHidError,
+    first_error_at: Instant,
+    now: Instant,
+) -> bool {
+    error.is_no_matching_device() && now.duration_since(first_error_at) >= INPUT_DEVICE_GONE_GRACE
 }
 
 fn should_read_input_collection(collection: &HidCollectionInfo) -> bool {
@@ -1052,6 +1062,28 @@ impl From<HidSnapshotError> for HostHidError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_device_requires_two_seconds_before_session_end() {
+        let first = Instant::now();
+        let missing = HostHidError::Hid(HidSnapshotError::NoMatchingDevice);
+        assert!(!missing_device_grace_elapsed(
+            &missing,
+            first,
+            first + Duration::from_millis(1999)
+        ));
+        assert!(missing_device_grace_elapsed(
+            &missing,
+            first,
+            first + Duration::from_secs(2)
+        ));
+        let other = HostHidError::MissingCollection(HidCollectionRole::PuckMain);
+        assert!(!missing_device_grace_elapsed(
+            &other,
+            first,
+            first + Duration::from_secs(2)
+        ));
+    }
 
     #[test]
     fn accepts_known_transient_collection_probe_errors() {
