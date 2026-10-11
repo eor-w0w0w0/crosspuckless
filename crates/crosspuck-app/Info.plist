@@ -16,6 +16,18 @@
   <string>0.1.0</string>
   <key>CFBundleVersion</key>
   <string>1</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>12.0</string>
+  <key>SUFeedURL</key>
+  <string>https://github.com/scryner/crosspuck/releases/latest/download/appcast.xml</string>
+  <key>SUPublicEDKey</key>
+  <string>HTtp4Ew0oG1HsOin0WhUUbpWKNbe8wbfoparbdNR820=</string>
+  <key>SUEnableAutomaticChecks</key>
+  <false/>
+  <key>SUAutomaticallyUpdate</key>
+  <false/>
+  <key>SUAllowsAutomaticUpdates</key>
+  <false/>
   <key>NSInputMonitoringUsageDescription</key>
   <string>CrossPuck reads Steam Controller HID input and forwards controller feedback for CrossOver Steam.</string>
   <key>LSUIElement</key>

@@ -162,11 +162,26 @@ pub struct HostServiceConfig {
 
 impl HostServiceHandle {
     pub fn shutdown(&self) {
+        self.shutdown_with_timeout(Duration::from_secs(2));
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Ok(mut thread) = self.thread.lock() {
-            if let Some(thread) = thread.take() {
-                let _ = thread.join();
-            }
+        // Do not hold the mutex while waiting or indefinitely block AppKit's
+        // termination notification. Sparkle must be able to finish relaunching
+        // even if an OS/device call in the HID worker has stalled.
+        let thread = self.thread.lock().ok().and_then(|mut thread| thread.take());
+        let Some(thread) = thread else {
+            return;
+        };
+        let deadline = Instant::now() + timeout;
+        while !thread.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if thread.is_finished() {
+            let _ = thread.join();
+        } else {
+            log::warn!("Host service cleanup timed out during application exit");
         }
     }
 }
@@ -1778,6 +1793,30 @@ mod tests {
 
         service.shutdown();
         assert_eq!(app_state.snapshot(), HostRuntimeState::Stopping);
+    }
+
+    #[test]
+    fn host_service_shutdown_does_not_wait_forever_for_a_stalled_worker() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            blocked.recv().unwrap();
+            finished.send(()).unwrap();
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = HostServiceHandle {
+            stop: stop.clone(),
+            thread: Arc::new(Mutex::new(Some(worker))),
+        };
+        let started = Instant::now();
+        handle.shutdown_with_timeout(Duration::from_millis(30));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(handle.thread.lock().unwrap().is_none());
+        // Repeated termination notifications must be harmless.
+        handle.shutdown_with_timeout(Duration::ZERO);
+        release.send(()).unwrap();
+        completion.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
