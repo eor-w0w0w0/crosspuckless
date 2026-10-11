@@ -1,6 +1,8 @@
 use std::process::ExitCode;
 
 #[cfg(target_os = "macos")]
+mod bottle_config;
+#[cfg(target_os = "macos")]
 mod bundle;
 #[cfg(target_os = "macos")]
 mod driver_install;
@@ -53,10 +55,10 @@ fn main() -> ExitCode {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use crate::bottle_config::{duplicate_xinput_hidden, set_duplicate_xinput_hidden};
     use crate::driver_install::{
-        check_driver_install_status, duplicate_xinput_hidden, install_driver,
-        set_duplicate_xinput_hidden, uninstall_driver, DriverInstallContext, DriverInstallState,
-        DriverInstallStatus,
+        check_driver_install_status, discover_bottle, find_steam_dir, install_driver,
+        uninstall_driver, DriverInstallContext, DriverInstallState, DriverInstallStatus,
     };
     use crate::runtime::{
         start_host_service_with_config, AppState, HostServiceConfig, HostServiceHandle,
@@ -68,10 +70,10 @@ mod macos {
         define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
     };
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSCellImagePosition,
-        NSControlStateValueOff, NSControlStateValueOn, NSImage, NSImageScaling, NSMenu,
-        NSMenuDelegate, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSSquareStatusItemLength,
-        NSStatusBar, NSStatusItem,
+        NSAlert, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
+        NSCellImagePosition, NSControlStateValueMixed, NSControlStateValueOff,
+        NSControlStateValueOn, NSImage, NSImageScaling, NSMenu, NSMenuDelegate, NSMenuItem,
+        NSModalResponseOK, NSOpenPanel, NSSquareStatusItemLength, NSStatusBar, NSStatusItem,
     };
     use objc2_foundation::{
         NSAutoreleasePool, NSBundle, NSNotification, NSObject, NSObjectProtocol, NSString, NSTimer,
@@ -304,16 +306,28 @@ mod macos {
             fn toggle_duplicate_xinput(&self, _sender: Option<&AnyObject>) {
                 let driver_state = &self.ivars().driver_state;
                 let Some(bottle) = active_bottle(driver_state) else {
+                    refresh_duplicate_xinput_item(driver_state, &self.ivars().items);
                     return;
                 };
-                let hidden = !duplicate_xinput_hidden(&bottle);
-                match set_duplicate_xinput_hidden(&bottle, hidden) {
-                    Ok(()) => log::info!(
-                        "CrossPuck duplicate XInput controller hidden={hidden} bottle={}",
+                let result = duplicate_xinput_hidden(&bottle).and_then(|hidden| {
+                    set_duplicate_xinput_hidden(&bottle, !hidden)?;
+                    Ok(!hidden)
+                });
+                match result {
+                    Ok(hidden) => log::info!(
+                        "CrossPuck duplicate XInput controller hidden={hidden} bottle={}; restart the bottle to apply",
                         bottle.display()
                     ),
                     Err(error) => {
-                        log::error!("CrossPuck failed to update bottle environment: {error}")
+                        log::error!("CrossPuck could not update {}: {error}", bottle.display());
+                        let mtm = self.mtm();
+                        let alert = NSAlert::new(mtm);
+                        alert.setMessageText(&NSString::from_str("Could not update the bottle"));
+                        alert.setInformativeText(&NSString::from_str(&format!(
+                            "{}\n\n{error}", display_path(&bottle)
+                        )));
+                        activate_app(mtm);
+                        alert.runModal();
                     }
                 }
                 refresh_duplicate_xinput_item(driver_state, &self.ivars().items);
@@ -571,11 +585,6 @@ mod macos {
         state_items.error.setEnabled(false);
         state_items.driver_status.setEnabled(false);
         state_items.bottle_info.setEnabled(false);
-        state_items
-            .duplicate_xinput
-            .setToolTip(Some(&NSString::from_str(
-                "Stop Wine from also exposing the controller as an XInput device in this bottle. Takes effect after restarting the bottle.",
-            )));
 
         let separator = NSMenuItem::separatorItem(mtm);
         menu.addItem(&separator);
@@ -717,22 +726,34 @@ mod macos {
             .setEnabled(!env_override && crate::settings::stored_bottle_path().is_some());
     }
 
-    fn refresh_duplicate_xinput_item(driver_state: &DriverMenuState, items: &StateMenuItems) {
-        let bottle = active_bottle(driver_state);
-        items.duplicate_xinput.setEnabled(bottle.is_some());
-        let state = if bottle.as_deref().is_some_and(duplicate_xinput_hidden) {
-            NSControlStateValueOn
-        } else {
-            NSControlStateValueOff
-        };
-        items.duplicate_xinput.setState(state);
+    fn active_bottle(driver_state: &DriverMenuState) -> Option<PathBuf> {
+        // Resolve independently of bundled-driver status and stale install snapshots.
+        discover_bottle(&driver_state.current_context())
+            .filter(|bottle| find_steam_dir(bottle).is_some())
     }
 
-    fn active_bottle(driver_state: &DriverMenuState) -> Option<PathBuf> {
-        driver_state
-            .current_context()
-            .bottle_path
-            .or_else(|| driver_state.discovered_bottle())
+    fn refresh_duplicate_xinput_item(driver_state: &DriverMenuState, items: &StateMenuItems) {
+        let bottle = active_bottle(driver_state);
+        let state = bottle.as_deref().map(duplicate_xinput_hidden);
+        items.duplicate_xinput.setState(match state {
+            Some(Ok(true)) => NSControlStateValueOn,
+            Some(Err(_)) => NSControlStateValueMixed,
+            _ => NSControlStateValueOff,
+        });
+        items
+            .duplicate_xinput
+            .setEnabled(matches!(state, Some(Ok(_))));
+        let tooltip = match state {
+            Some(Ok(_)) => format!(
+                "Hide all controllers with VID/PID 0x05AC/0x0004 in {}. The checkmark reflects the saved setting. Quit all apps in this bottle and restart the bottle to apply. Other ignored controllers are preserved.",
+                display_path(bottle.as_deref().unwrap())
+            ),
+            Some(Err(error)) => format!("Cannot safely edit this bottle's controller settings: {error}"),
+            None => "Choose a CrossOver bottle with Steam installed to use this option.".to_string(),
+        };
+        items
+            .duplicate_xinput
+            .setToolTip(Some(&NSString::from_str(&tooltip)));
     }
 
     fn display_path(path: &Path) -> String {
@@ -1066,5 +1087,72 @@ mod macos {
         let image = NSImage::initWithContentsOfFile(NSImage::alloc(), path)?;
         image.setTemplate(true);
         Some(image)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        #[test]
+        fn controller_toggle_resolves_current_bottle_without_bundled_driver() {
+            let root = std::env::temp_dir().join(format!(
+                "crosspuck-active-bottle-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let default = root.join("Bottles/Steam");
+            let external = root.join("External/Preview Steam");
+            for bottle in [&default, &external] {
+                let steam = bottle.join("drive_c/Program Files (x86)/Steam");
+                fs::create_dir_all(&steam).unwrap();
+                fs::write(steam.join("steam.exe"), "").unwrap();
+                fs::write(bottle.join("cxbottle.conf"), "[EnvironmentVariables]\n\"SDL_GAMECONTROLLER_IGNORE_DEVICES\"=\"0x045E/0x028E\"\n").unwrap();
+            }
+            let state = DriverMenuState::new(DriverInstallContext {
+                crossover_bottles_dir: Some(root.join("Bottles")),
+                ..DriverInstallContext::default()
+            });
+            state.refresh_status();
+            assert!(matches!(
+                &*state.snapshot.lock().unwrap(),
+                DriverMenuSnapshot::Status(DriverInstallStatus {
+                    state: DriverInstallState::BundledDriverMissing,
+                    ..
+                })
+            ));
+            assert_eq!(active_bottle(&state), Some(default.clone()));
+            state.set_bottle_path(Some(external.clone()));
+            assert_eq!(active_bottle(&state), Some(external.clone()));
+            let default_config = fs::read(default.join("cxbottle.conf")).unwrap();
+            let external_config = fs::read(external.join("cxbottle.conf")).unwrap();
+            set_duplicate_xinput_hidden(&active_bottle(&state).unwrap(), true).unwrap();
+            assert!(duplicate_xinput_hidden(&external).unwrap());
+            assert_eq!(
+                fs::read(default.join("cxbottle.conf")).unwrap(),
+                default_config
+            );
+            set_duplicate_xinput_hidden(&active_bottle(&state).unwrap(), false).unwrap();
+            assert_eq!(
+                fs::read(external.join("cxbottle.conf")).unwrap(),
+                external_config
+            );
+            assert_eq!(
+                fs::read(default.join("cxbottle.conf")).unwrap(),
+                default_config
+            );
+            // An invalid explicit selection must never edit another bottle.
+            state.set_bottle_path(Some(root.join("missing")));
+            assert_eq!(active_bottle(&state), None);
+            state.set_bottle_path(Some(root.clone()));
+            assert_eq!(active_bottle(&state), None);
+            state.set_bottle_path(None);
+            assert_eq!(active_bottle(&state), Some(default));
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }

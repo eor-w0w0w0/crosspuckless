@@ -89,6 +89,32 @@ environment variables override this for scripting: `CROSSPUCK_BOTTLE_PATH`
 selects a specific bottle and takes precedence over the menu selection, and
 `CROSSPUCK_BOTTLES_DIR` changes the directory that auto-detection scans.
 
+### Hide The Duplicate Generic Controller
+
+If CrossOver Steam sees both CrossPuck's Steam Controller and a generic XInput
+controller, enable `Advanced` > `Hide Duplicate XInput Controller`. This edits
+only the currently selected (or auto-detected) Steam bottle, including bottles
+outside the default directory and CrossOver Preview bottles. Quit all apps in
+that bottle and restart the bottle for the change to take effect.
+
+The toggle adds or removes `0x05AC/0x0004` in the bottle's
+`SDL_GAMECONTROLLER_IGNORE_DEVICES` environment variable. Existing ignored
+devices, other settings, comments and formatting are preserved. The checkmark
+reflects the saved bottle setting; it does not indicate whether a running Wine
+process has picked up the change. This VID/PID filter affects every controller
+with that identity in this bottle.
+
+The option is disabled when no valid Steam bottle is found or its configuration
+cannot be edited safely. Read-only files, symlinks, file-backed (`@file`) lists,
+repeated environment sections, duplicate keys and unsupported syntax must be
+managed manually; CrossPuck leaves them intact and shows an indeterminate,
+disabled menu item with the reason in its tooltip. Supported lists use
+comma-separated `0xVID/0xPID` pairs with either both the name and value quoted
+or both unquoted. Write failures show an error dialog. Saves use a temporary
+file and atomic replacement, preserving file permissions and rejecting observed
+external changes. This does not lock out concurrent CrossOver edits. The toggle
+is independent of installing or uninstalling CrossPuck's Steam driver.
+
 ### Verify Wine DLL Override
 
 If Steam does not see the controller, verify the Wine DLL override manually:
