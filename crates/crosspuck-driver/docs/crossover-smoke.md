@@ -149,16 +149,16 @@ touches HID:
 [crosspuck] lazy bridge connect failed reason=...: ...
 ```
 
-The automatic worker retries even if Steam makes no further HID calls. After a
-successful identity handshake and input-channel attachment it notifies SDL:
+The connection worker retries even if Steam makes no further HID calls. After a
+successful identity handshake and input-channel attachment, its device generation
+advances the hooked `SDL_hid_device_change_count` so SDL rescans. The log records:
 
 ```text
-[crosspuck] automatic discovery worker started
-[crosspuck] automatic discovery notified SDL change=Arrival(1)
+[crosspuck] lazy bridge connect ok reason=connection worker identity=Live ...
 ```
 
-The number is a connection generation within this Steam process. A host restart
-advances it. A disconnected session produces `change=Removal`.
+Disconnect and reconnect each advance the device generation. Reconnect attempts
+and teardown stay off SDL/HID hooks; no external notification helper is required.
 
 ## Late Host Start And Reconnect
 
@@ -166,10 +166,10 @@ advances it. A disconnected session produces `change=Removal`.
 2. Open controller settings and record the Steam process ID and current log
    position. Leave the screen open.
 3. Start CrossPuck. Do not reopen settings or run the PoC notification helper.
-4. Confirm a successful bridge connection and an automatic SDL arrival in the
-   new log lines, followed by controller recognition and working input.
+4. Confirm a successful worker bridge connection in the new log lines, followed
+   by controller recognition and working input.
 5. Quit CrossPuck, wait five seconds, then start it again. Confirm another
-   arrival generation and working input with the same Steam process ID.
+   worker connection and working input with the same Steam process ID.
 6. Separately check the original host-first launch order and rumble/ping.
 
 Run this with the physical Puck connected and Input Monitoring permission
@@ -224,7 +224,7 @@ Minimum pass:
 - Input actions produce host-backed input trace or visible Steam UI response.
 - Feature/output/write actions do not fail the UI flow.
 - Host app stop/start does not crash Steam and later actions recover.
-- Host-late startup and restart produce an automatic SDL arrival and working
+- Host-late startup and restart produce an automatic SDL rescan and working
   input while the Steam process ID remains unchanged.
 
 ## Rollback

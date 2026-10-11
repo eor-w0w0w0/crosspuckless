@@ -1,5 +1,5 @@
 use super::{
-    discovery, hooks,
+    hooks,
     log::{debug_line, error_line, info_line, set_log_level},
     state,
 };
@@ -7,12 +7,12 @@ use crosspuck_core::guest_driver::RuntimeConfig;
 use std::ffi::c_void;
 use std::panic;
 use windows_sys::core::BOOL;
-use windows_sys::Win32::Foundation::{HINSTANCE, TRUE};
+use windows_sys::Win32::Foundation::{FALSE, HINSTANCE, TRUE};
 use windows_sys::Win32::System::LibraryLoader::{
-    DisableThreadLibraryCalls, GetModuleHandleExA, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+    DisableThreadLibraryCalls, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
     GET_MODULE_HANDLE_EX_FLAG_PIN,
 };
-use windows_sys::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
+use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 
 #[no_mangle]
 pub unsafe extern "system" fn DllMain(
@@ -22,36 +22,38 @@ pub unsafe extern "system" fn DllMain(
 ) -> BOOL {
     match reason {
         DLL_PROCESS_ATTACH => {
+            // Hooks and the attach worker execute DLL code for the process lifetime.
+            // Pin before spawning, so FreeLibrary cannot race their initialization.
+            let mut module = std::ptr::null_mut();
+            if GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                DllMain as *const () as *const u16,
+                &mut module,
+            ) == 0
+            {
+                return FALSE;
+            }
             DisableThreadLibraryCalls(hinst);
             std::thread::spawn(|| {
                 let _ = panic::catch_unwind(attach);
             });
         }
-        DLL_PROCESS_DETACH => {
-            // Do not join workers or take runtime locks under the loader lock.
-            // At process exit Windows closes the transport handles for us.
-            discovery::stop();
-        }
         _ => {}
     }
+    // No locks, network work, bridge drops or joins during process detach.
     TRUE
 }
 
-fn attach() {
-    // Hooks and the discovery worker have process lifetime. Keep their code
-    // mapped even if a caller releases its reference to the proxy DLL.
-    let mut module = std::ptr::null_mut();
-    if unsafe {
-        GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-            DllMain as *const u8,
-            &mut module,
-        )
-    } == 0
-    {
-        error_line("[crosspuck] could not pin driver module; skipping hooks");
-        return;
+/// Optional explicit shutdown for callers outside the loader lock. The pinned
+/// module and hooks remain valid; process detach never calls this blocking path.
+#[no_mangle]
+pub extern "system" fn CrossPuckShutdown() {
+    if let Some(runtime) = state::runtime() {
+        runtime.stop_connection_worker();
     }
+}
+
+fn attach() {
     let config = RuntimeConfig::driver_defaults();
     set_log_level(config.log_level);
     let host_bridge_enabled = config.host_bridge_enabled;
@@ -68,7 +70,8 @@ fn attach() {
                 .map(|name| name.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| "<unknown>".to_string());
-    let bridge_connect_allowed = process.eq_ignore_ascii_case("steam.exe");
+    let bridge_connect_allowed =
+        crate::connectivity::connection_worker_allowed(&process, host_bridge_enabled);
     if !state::init_runtime(config, bridge_connect_allowed) {
         debug_line("[crosspuck] driver runtime already initialized");
         return;
@@ -76,7 +79,6 @@ fn attach() {
 
     if let Err(error) = hooks::install() {
         error_line(&format!("[crosspuck] hook install failed: {error}"));
-        return;
     } else {
         debug_line("[crosspuck] hook install ok");
     }
@@ -94,8 +96,5 @@ fn attach() {
         "[crosspuck] driver timeouts connect_ms={} handshake_ms={} io_ms={} reconnect_ms={}",
         connect_timeout_ms, handshake_timeout_ms, io_timeout_ms, reconnect_interval_ms
     ));
-    if bridge_connect_allowed && host_bridge_enabled {
-        // attach already runs outside DllMain on its own worker thread.
-        discovery::run();
-    }
+    state::run_connection_worker();
 }

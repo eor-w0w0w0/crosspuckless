@@ -119,15 +119,34 @@ sign_app_bundle() {
     codesign --force --timestamp --options runtime --sign "$identity" \
       --identifier com.github.scryner.crosspuck.audio "$app/Contents/MacOS/CrossPuckAudio"
   fi
+  local framework="$app/Contents/Frameworks/Sparkle.framework"
+  if [[ ! -d "$framework" ]]; then
+    echo "Sparkle framework missing from app bundle: $framework" >&2
+    exit 1
+  fi
+  # Sign nested code inside-out, matching Sparkle's manual distribution guide.
+  # Downloader may carry its own sandbox entitlements; preserve those only.
+  codesign --force --timestamp --options runtime --sign "$identity" \
+    "$framework/Versions/B/XPCServices/Installer.xpc"
+  codesign --force --timestamp --options runtime --preserve-metadata=entitlements \
+    --sign "$identity" "$framework/Versions/B/XPCServices/Downloader.xpc"
+  codesign --force --timestamp --options runtime --sign "$identity" \
+    "$framework/Versions/B/Autoupdate"
+  codesign --force --timestamp --options runtime --sign "$identity" \
+    "$framework/Versions/B/Updater.app"
+  codesign --force --timestamp --options runtime --sign "$identity" "$framework"
   codesign --force --timestamp --options runtime --sign "$identity" "$app"
-  codesign --verify --strict --verbose=4 "$app"
+  codesign --verify --deep --strict --verbose=4 "$app"
 }
 
 verify_app_bundle_for_notarization() {
   local app="$1"
+  local framework="$app/Contents/Frameworks/Sparkle.framework"
+  local app_team
+  local nested_team
 
   require_command codesign
-  if ! codesign --verify --strict --verbose=4 "$app"; then
+  if ! codesign --verify --deep --strict --verbose=4 "$app"; then
     cat >&2 <<EOF
 App bundle is not signed for notarization:
   $app
@@ -135,6 +154,60 @@ App bundle is not signed for notarization:
 Pass --app-sign-identity ID or set CROSSPUCK_APP_SIGN_IDENTITY.
 EOF
     exit 1
+  fi
+  app_team="$(codesign --display --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+  if [[ -z "$app_team" || "$app_team" == "not set" ]]; then
+    echo "The app needs a Developer ID team signature for notarization: $app" >&2
+    exit 1
+  fi
+  for nested in "$framework/Versions/B/XPCServices/Installer.xpc" \
+    "$framework/Versions/B/XPCServices/Downloader.xpc" \
+    "$framework/Versions/B/Autoupdate" "$framework/Versions/B/Updater.app" "$framework"; do
+    nested_team="$(codesign --display --verbose=4 "$nested" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+    if [[ "$nested_team" != "$app_team" ]]; then
+      echo "Sparkle nested code must be signed by the app's team before notarization: $nested" >&2
+      echo "Use --app-sign-identity to sign the complete app and its helpers." >&2
+      exit 1
+    fi
+  done
+}
+
+verify_updater_configuration() {
+  local app="$1"
+  local framework="$app/Contents/Frameworks/Sparkle.framework"
+  local public_key
+  local canonical_key
+  local key_length
+  local feed_url
+  local single_line_feed
+
+  for executable in Sparkle Autoupdate Updater.app/Contents/MacOS/Updater \
+    XPCServices/Installer.xpc/Contents/MacOS/Installer \
+    XPCServices/Downloader.xpc/Contents/MacOS/Downloader; do
+    if [[ ! -x "$framework/Versions/B/$executable" ]]; then
+      echo "Sparkle framework/helper missing from app: $framework/Versions/B/$executable" >&2
+      exit 1
+    fi
+  done
+  feed_url="$(/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$app/Contents/Info.plist" 2>/dev/null || true)"
+  single_line_feed="$(printf '%s' "$feed_url" | tr -d '\r\n')"
+  if [[ "$single_line_feed" != "$feed_url" ]] || \
+    ! printf '%s' "$feed_url" | grep -Eq '^https://[^[:space:]"<>]+$'; then
+    echo "App bundle must contain a valid HTTPS Sparkle feed URL." >&2
+    exit 1
+  fi
+  if [[ "$profile" == "release" ]]; then
+    public_key="$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$app/Contents/Info.plist" 2>/dev/null || true)"
+    if ! printf '%s' "$public_key" | grep -Eq '^[A-Za-z0-9+/]{43}=$'; then
+      echo "Release app bundle must contain a valid Sparkle Ed25519 public key." >&2
+      exit 1
+    fi
+    key_length="$(printf '%s' "$public_key" | base64 -D | wc -c | tr -d '[:space:]')"
+    canonical_key="$(printf '%s' "$public_key" | base64 -D | base64 | tr -d '\n')"
+    if [[ "$key_length" != "32" || "$canonical_key" != "$public_key" ]]; then
+      echo "Release app's Sparkle public key must be a canonical 32-byte base64 key." >&2
+      exit 1
+    fi
   fi
 }
 
@@ -364,10 +437,6 @@ if [[ -z "$version" ]]; then
   exit 1
 fi
 
-if [[ -z "$volume_name" ]]; then
-  volume_name="CrossPuck $version"
-fi
-
 if [[ -z "$app_path" ]]; then
   app_path="$root_dir/target/$profile/CrossPuck.app"
   if [[ "$no_build" != "1" ]]; then
@@ -383,6 +452,12 @@ if [[ ! -d "$app_path" ]]; then
     echo "Build it first, or pass --app PATH." >&2
   fi
   exit 1
+fi
+
+verify_updater_configuration "$app_path"
+version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Contents/Info.plist")"
+if [[ -z "$volume_name" ]]; then
+  volume_name="CrossPuck $version"
 fi
 
 if [[ -n "$app_sign_identity" ]]; then

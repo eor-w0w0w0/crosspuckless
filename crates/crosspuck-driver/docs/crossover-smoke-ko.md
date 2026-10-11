@@ -159,15 +159,15 @@ host app을 늦게 켠 경우에는 다음 로그가 먼저 나올 수 있습니
 ```
 
 이 경우 host app을 켜면 추가 조작 없이 자동 연결되어야 합니다. 연결과 input
-channel attach가 완료된 뒤 다음과 같은 SDL 재탐색 통지가 기록됩니다.
+channel attach가 완료되면 장치 세대가 증가하고, hook된
+`SDL_hid_device_change_count`를 통해 SDL이 다시 탐색합니다. 연결 로그 예:
 
 ```text
-[crosspuck] automatic discovery worker started
-[crosspuck] automatic discovery notified SDL change=Arrival(1)
+[crosspuck] lazy bridge connect ok reason=connection worker identity=Live ...
 ```
 
-숫자는 해당 Steam 프로세스 안의 연결 세대이며 재연결마다 증가합니다.
-연결이 끊기면 `change=Removal`이 기록됩니다.
+연결 종료와 재연결마다 장치 세대가 증가합니다. 연결 시도와 종료 처리는 SDL/HID
+hook 밖의 전용 워커에서 수행하며 외부 notification helper는 필요하지 않습니다.
 
 ### Host를 나중에 실행하는 경로
 
@@ -175,10 +175,10 @@ channel attach가 완료된 뒤 다음과 같은 SDL 재탐색 통지가 기록�
 2. Controller settings를 열고 Steam PID와 현재 로그 위치를 기록합니다.
 3. 화면을 그대로 둔 채 CrossPuck을 시작합니다. 설정 화면을 다시 열거나 PoC
    notification helper를 실행하지 않습니다.
-4. 이번 실행에서 추가된 로그에 연결 성공과 자동 SDL arrival이 기록되고,
+4. 이번 실행에서 추가된 로그에 전용 워커 연결 성공이 기록되고,
    controller가 표시되며 실제 입력이 반영되는지 확인합니다.
 5. CrossPuck을 종료하고 5초 후 다시 시작합니다. Steam PID가 유지된 상태에서
-   새로운 arrival 세대와 입력 복구를 확인합니다.
+   새로운 워커 연결과 입력 복구를 확인합니다.
 6. Puck을 연결하지 않은 상태에서는 동작 가능한 장치로 광고하지 않는지,
    Puck 연결 후에는 자동으로 복구되는지도 별도로 확인합니다.
 
@@ -247,7 +247,7 @@ tools/smoke-check.sh --bottle Steam
 - host app 실행 상태에서 `lazy bridge connect ok` 또는 이후 host-backed HID 호출 trace가 있습니다.
 - Steam UI에서 controller가 연결된 장치로 표시되거나 입력 반응이 있습니다.
 - host app 종료/재실행 후 Steam이 crash하지 않고, 이후 controller 관련 동작이 복구됩니다.
-- host를 나중에 실행하거나 재시작해도 Steam PID가 유지된 채 자동 SDL arrival,
+- host를 나중에 실행하거나 재시작해도 Steam PID가 유지된 채 자동 SDL 재탐색,
   장치 인식, 실제 입력 복구가 확인됩니다.
 
 권장 추가 통과:

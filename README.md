@@ -32,7 +32,7 @@ source tree are not required.
 
 ### Requirements
 
-- macOS.
+- macOS 12 or later.
 - A CrossOver or CrossOver Preview Steam bottle.
 - Steam Puck/Controller visible to the macOS host.
 - Steam Puck/Controller paired with a native app on macOS or Windows.
@@ -61,6 +61,25 @@ The installer handles both `/Applications/CrossOver.app` and
 `/Applications/CrossOver Preview.app`. Preview-marked bottles import through
 CrossOver Preview first; regular bottles import through CrossOver first; the
 other app is used as a fallback when only one is installed.
+
+### App Updates
+
+Use the menu bar `Check for Updates...` item to download and install a newer
+CrossPuck release inside the app. `Automatically Check for Updates` enables
+periodic checks and remembers the choice; it is off by default. A background
+check indicates an available update through the menu's `Update Available...`
+item. Click it to open the update dialog. An update still requires approval
+before installation and restart. Finish your game before
+restarting CrossPuck, because its controller bridge stops during the restart.
+
+The updater uses [Sparkle 2](https://sparkle-project.org/) and the same signed,
+notarized DMG assets hosted on [GitHub Releases](https://github.com/scryner/crosspuck/releases).
+The first Sparkle-enabled version must be installed from a DMG once. Versions
+released before this feature cannot update themselves into it.
+
+Updating the app also updates its embedded guest driver. A `hid.dll` already
+installed in a CrossOver bottle is updated separately: quit Steam and use the
+menu's driver install/update action when the bundled driver is newer.
 
 ### Bottles In A Non-Default Location
 
@@ -101,6 +120,32 @@ while the game's original output remains available. See
 [audio routing design and validation](docs/audio-routing.md) for tested devices
 and remaining hardware coverage.
 
+### Hide The Duplicate Generic Controller
+
+If CrossOver Steam sees both CrossPuck's Steam Controller and a generic XInput
+controller, enable `Advanced` > `Hide Duplicate XInput Controller`. This edits
+only the currently selected (or auto-detected) Steam bottle, including bottles
+outside the default directory and CrossOver Preview bottles. Quit all apps in
+that bottle and restart the bottle for the change to take effect.
+
+The toggle adds or removes `0x05AC/0x0004` in the bottle's
+`SDL_GAMECONTROLLER_IGNORE_DEVICES` environment variable. Existing ignored
+devices, other settings, comments and formatting are preserved. The checkmark
+reflects the saved bottle setting; it does not indicate whether a running Wine
+process has picked up the change. This VID/PID filter affects every controller
+with that identity in this bottle.
+
+The option is disabled when no valid Steam bottle is found or its configuration
+cannot be edited safely. Read-only files, symlinks, file-backed (`@file`) lists,
+repeated environment sections, duplicate keys and unsupported syntax must be
+managed manually; CrossPuck leaves them intact and shows an indeterminate,
+disabled menu item with the reason in its tooltip. Supported lists use
+comma-separated `0xVID/0xPID` pairs with either both the name and value quoted
+or both unquoted. Write failures show an error dialog. Saves use a temporary
+file and atomic replacement, preserving file permissions and rejecting observed
+external changes. This does not lock out concurrent CrossOver edits. The toggle
+is independent of installing or uninstalling CrossPuck's Steam driver.
+
 ### Verify Wine DLL Override
 
 If Steam does not see the controller, verify the Wine DLL override manually:
@@ -123,7 +168,7 @@ Use these instructions when building CrossPuck from this repository.
 
 ### Requirements
 
-- macOS with Rust installed.
+- macOS 12 or later with Rust and Python 3.9 or later installed.
 - A checkout of this repository.
 - A CrossOver or CrossOver Preview Steam bottle.
 - Steam Puck/Controller visible to the macOS host.
@@ -136,6 +181,13 @@ rustup target add x86_64-pc-windows-gnu
 ```
 
 ### Build The Host App
+
+The packaging scripts fetch a checksum-pinned Sparkle 2 distribution into
+`build/sparkle-2.10.0`. Release app bundles require a genuine update public key
+in `Info.plist` or `CROSSPUCK_SPARKLE_PUBLIC_KEY`. A debug bundle built without
+a configured key keeps app updates disabled. See the
+[Sparkle release procedure](tools/README.md#sparkle-app-updates-and-github-releases)
+for signing-key setup and GitHub publication.
 
 Build a debug app bundle. The bundle includes the release guest `hid.dll` under
 `Contents/Resources/GuestDriver/`:
@@ -169,6 +221,15 @@ CrossPuck.app/Contents/Resources/LICENSE
 CrossPuck.app/Contents/Resources/THIRD-PARTY-NOTICES.md
 ```
 
+Unsigned builds get a new ad-hoc signature every time, so macOS asks for
+Input Monitoring again after each rebuild. Set `CROSSPUCK_APP_SIGN_IDENTITY`
+to a codesigning identity to sign the bundle and keep the permission across
+rebuilds:
+
+```sh
+CROSSPUCK_APP_SIGN_IDENTITY="Apple Development" tools/build-app.sh release
+```
+
 ### Build A DMG
 
 Create a drag-and-drop installer DMG from the release app bundle:
@@ -180,7 +241,7 @@ tools/build-dmg.sh
 The default output is:
 
 ```text
-target/dmg/CrossPuck-0.1.0.dmg
+target/dmg/CrossPuck-0.4.0.dmg
 ```
 
 The DMG opens in a conventional drag-and-drop Finder layout: a large
@@ -193,8 +254,29 @@ that signed app:
 tools/build-dmg.sh --app target/release/CrossPuck.app
 ```
 
-The script does not notarize. GitHub Actions can notarize and staple the signed
-app before packaging, or notarize and staple the generated DMG after packaging.
+For a public release, sign the app and DMG with a Developer ID Application
+identity, then notarize and staple the final DMG:
+
+```sh
+tools/build-dmg.sh \
+  --app-sign-identity "$CROSSPUCK_APP_SIGN_IDENTITY" \
+  --dmg-sign-identity "$CROSSPUCK_APP_SIGN_IDENTITY" \
+  --notarize \
+  --notary-keychain-profile CrossPuck
+```
+
+Prepare the signed appcast and the exact DMG assets for review before publishing:
+
+```sh
+tools/publish-release.sh \
+  --dmg target/dmg/CrossPuck-0.4.0.dmg \
+  --tag v0.4.0 \
+  --notes-file /path/to/release-notes.md \
+  --dry-run
+```
+
+Preparation does not upload anything. The [release procedure](tools/README.md#sparkle-app-updates-and-github-releases)
+describes the explicit `--publish` step, the stable appcast URL, and validation.
 
 ### Run The Built App And Install Driver
 

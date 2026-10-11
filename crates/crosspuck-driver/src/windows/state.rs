@@ -81,6 +81,37 @@ pub fn catalog_if_connected(reason: &'static str) -> Option<VirtualHidProfileCat
     catalog
 }
 
+pub fn device_change_generation() -> u32 {
+    runtime().map_or(0, GuestDriverRuntime::device_generation)
+}
+
+pub fn run_connection_worker() {
+    if !bridge_connect_allowed() {
+        return;
+    }
+    if let Some(runtime) = runtime() {
+        let previous = Mutex::new(runtime.snapshot());
+        runtime.run_connection_worker(|| {
+            apply_connection_logging(runtime);
+            if let Some(error) = runtime.connection_error() {
+                log_bridge_connect_failed(runtime, "connection worker", &error);
+            } else {
+                clear_bridge_connect_error();
+            }
+            let snapshot = runtime.snapshot();
+            if let Ok(mut previous) = previous.lock() {
+                log_catalog_state(
+                    "connection worker",
+                    &previous,
+                    &snapshot,
+                    runtime.catalog().is_some(),
+                );
+                *previous = snapshot;
+            }
+        });
+    }
+}
+
 fn log_bridge_connect_failed(
     runtime: &GuestDriverRuntime,
     reason: &'static str,

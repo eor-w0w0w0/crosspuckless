@@ -61,8 +61,9 @@ helper restart, avoiding reuse of potentially invalid callback state.
 
 The last public audio-service handle stops and joins its worker. The worker
 owns separate shared state, so it cannot keep the service owner alive itself.
-Menu objects remain scoped across `app.run()` rather than being explicitly
-leaked. Native retry/transition iterations have their own autorelease pool,
+The application delegate shuts down the audio service for both normal Quit
+and Sparkle update/relaunch. Menu objects remain scoped across `app.run()`
+rather than being explicitly leaked. Native retry/transition iterations have their own autorelease pool,
 and both startup failures and shutdown release the watcher, pipe, run-loop
 source and lease.
 

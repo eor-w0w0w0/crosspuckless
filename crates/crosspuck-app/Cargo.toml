@@ -31,6 +31,7 @@ sha2.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
 objc2-app-kit = { workspace = true, features = [
+    "NSAlert",
     "NSApplication",
     "NSButton",
     "NSCell",
@@ -53,6 +54,8 @@ objc2-app-kit = { workspace = true, features = [
 objc2-foundation = { workspace = true, features = [
     "NSDate",
     "NSBundle",
+    "NSError",
+    "NSNotification",
     "NSAutoreleasePool",
     "NSObject",
     "NSProcessInfo",
