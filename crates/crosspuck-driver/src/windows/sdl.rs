@@ -1,6 +1,6 @@
 use super::buffers::{input_slice, output_slice, report_id_from_buffer};
 use super::handles::{handle_for_profile, profile_for_handle};
-use super::log::{debug_line, error_line, info_line, trace_line};
+use super::log::{debug_line, error_line, trace_line};
 use super::proc::fn_from_mut;
 use super::state;
 use crosspuck_core::guest_driver::{
@@ -11,7 +11,6 @@ use std::ffi::{c_char, c_int, c_void, CString};
 use std::fmt;
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,7 +31,6 @@ type SdlHidSendFeatureReportFn = unsafe extern "C" fn(*mut c_void, *const u8, us
 
 static ORIGINAL_SDL_HID_CLOSE: OnceLock<SdlHidCloseFn> = OnceLock::new();
 static ORIGINAL_SDL_HID_DEVICE_CHANGE_COUNT: OnceLock<SdlHidDeviceChangeCountFn> = OnceLock::new();
-static SDL_DEVICE_CHANGE_COUNT_CALLED: AtomicBool = AtomicBool::new(false);
 static ORIGINAL_SDL_HID_ENUMERATE: OnceLock<SdlHidEnumerateFn> = OnceLock::new();
 static ORIGINAL_SDL_HID_FREE_ENUMERATION: OnceLock<SdlHidFreeEnumerationFn> = OnceLock::new();
 static ORIGINAL_SDL_HID_OPEN_PATH: OnceLock<SdlHidOpenPathFn> = OnceLock::new();
@@ -201,16 +199,11 @@ pub unsafe extern "C" fn detoured_sdl_hid_close(device: *mut c_void) {
 }
 
 pub unsafe extern "C" fn detoured_sdl_hid_device_change_count() -> u32 {
-    if !SDL_DEVICE_CHANGE_COUNT_CALLED.swap(true, Ordering::Relaxed) {
-        info_line("[crosspuck] SDL_hid_device_change_count first call");
-    }
     let original = ORIGINAL_SDL_HID_DEVICE_CHANGE_COUNT
         .get()
         .copied()
         .map_or(0, |original| original());
-    original.wrapping_add(state::device_change_generation(
-        "SDL_hid_device_change_count",
-    ))
+    crate::connectivity::device_change_count(original, state::device_change_generation())
 }
 
 pub unsafe extern "C" fn detoured_sdl_hid_enumerate(
