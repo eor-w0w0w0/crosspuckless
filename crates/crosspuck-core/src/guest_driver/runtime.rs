@@ -1,4 +1,4 @@
-use super::bridge::{HostBridge, HostBridgeError};
+use super::bridge::{HostBridge, HostBridgeConfig, HostBridgeError};
 use super::config::{RuntimeConfig, DEFAULT_IO_TIMEOUT};
 use super::handles::{VirtualHandleId, VirtualHandleTable};
 use super::identity::{RuntimeIdentity, RuntimeIdentityState};
@@ -6,7 +6,8 @@ use super::profile::{VirtualHidProfile, VirtualHidProfileCatalog};
 use super::trace::TraceLimiter;
 use crate::protocol::{GuestRuntimeOverrides, LogSeverity};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const DEFAULT_GET_FEATURE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -15,12 +16,49 @@ const DEFAULT_FEEDBACK_TIMEOUT: Duration = Duration::from_millis(20);
 
 pub struct GuestDriverRuntime {
     config: RuntimeConfig,
-    bridge: Mutex<Option<Arc<HostBridge>>>,
-    identity: Mutex<RuntimeIdentity>,
-    catalog: Mutex<Option<VirtualHidProfileCatalog>>,
+    connection: Mutex<ConnectionState>,
+    wake: Condvar,
     handles: Mutex<VirtualHandleTable>,
-    last_connect_attempt: Mutex<Option<Instant>>,
     trace_limiter: Mutex<TraceLimiter>,
+    device_generation: AtomicU32,
+}
+
+struct ConnectionState {
+    bridge: Option<Arc<HostBridge>>,
+    identity: RuntimeIdentity,
+    catalog: Option<VirtualHidProfileCatalog>,
+    // Retain the worker's reference until all operations release their clones.
+    // Only the connection worker may drop the last reference (HostBridge joins).
+    retired: Vec<Arc<HostBridge>>,
+    worker_running: bool,
+    stopping: bool,
+    connecting: bool,
+    epoch: u64,
+    retry: RetrySchedule,
+    reconnect_interval: Duration,
+    last_error: Option<String>,
+}
+
+#[derive(Default)]
+struct RetrySchedule {
+    completed_at: Option<Instant>,
+    interval: Duration,
+}
+
+impl RetrySchedule {
+    fn remaining(&self, now: Instant) -> Duration {
+        self.completed_at
+            .map(|completed| {
+                self.interval
+                    .saturating_sub(now.saturating_duration_since(completed))
+            })
+            .unwrap_or_default()
+    }
+
+    fn failed_at(&mut self, completed: Instant, interval: Duration) {
+        self.completed_at = Some(completed);
+        self.interval = interval;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,14 +82,26 @@ impl GuestDriverRuntime {
             config.trace_report_max_bytes,
         );
 
+        let reconnect_interval = config.lazy_reconnect_interval;
         Self {
             config,
-            bridge: Mutex::new(None),
-            identity: Mutex::new(identity),
-            catalog: Mutex::new(catalog),
+            connection: Mutex::new(ConnectionState {
+                bridge: None,
+                identity,
+                catalog,
+                retired: Vec::new(),
+                worker_running: false,
+                stopping: false,
+                connecting: false,
+                epoch: 0,
+                retry: RetrySchedule::default(),
+                reconnect_interval,
+                last_error: None,
+            }),
+            wake: Condvar::new(),
             handles: Mutex::new(VirtualHandleTable::default()),
-            last_connect_attempt: Mutex::new(None),
             trace_limiter: Mutex::new(trace_limiter),
+            device_generation: AtomicU32::new(0),
         }
     }
 
@@ -60,20 +110,18 @@ impl GuestDriverRuntime {
     }
 
     pub fn snapshot(&self) -> GuestDriverSnapshot {
+        let state = self.connection.lock().unwrap();
         GuestDriverSnapshot {
-            identity_state: self
-                .identity
-                .lock()
-                .map(|identity| identity.state())
-                .unwrap_or(RuntimeIdentityState::Missing),
-            bridge_connected: self.bridge.lock().is_ok_and(|bridge| bridge.is_some()),
-            session_trace_id: self.session_trace_id(),
-            advertised_profiles: self
+            identity_state: state.identity.state(),
+            bridge_connected: state.bridge.is_some(),
+            session_trace_id: state
+                .bridge
+                .as_ref()
+                .map(|bridge| bridge.info().session_trace_id),
+            advertised_profiles: state
                 .catalog
-                .lock()
-                .ok()
-                .and_then(|catalog| catalog.as_ref().map(|catalog| catalog.descriptors().len()))
-                .unwrap_or(0),
+                .as_ref()
+                .map_or(0, |catalog| catalog.descriptors().len()),
             open_handles: self
                 .handles
                 .lock()
@@ -87,10 +135,12 @@ impl GuestDriverRuntime {
     }
 
     pub fn session_trace_id(&self) -> Option<u32> {
-        self.bridge
-            .lock()
-            .ok()
-            .and_then(|bridge| bridge.as_ref().map(|bridge| bridge.info().session_trace_id))
+        self.connection.lock().ok().and_then(|state| {
+            state
+                .bridge
+                .as_ref()
+                .map(|bridge| bridge.info().session_trace_id)
+        })
     }
 
     pub fn guest_log_level_override(&self) -> Option<LogSeverity> {
@@ -98,11 +148,12 @@ impl GuestDriverRuntime {
     }
 
     pub fn guest_runtime_overrides(&self) -> GuestRuntimeOverrides {
-        self.bridge
+        self.connection
             .lock()
             .ok()
-            .and_then(|bridge| {
-                bridge
+            .and_then(|state| {
+                state
+                    .bridge
                     .as_ref()
                     .map(|bridge| bridge.info().guest_runtime_overrides.clone())
             })
@@ -110,43 +161,30 @@ impl GuestDriverRuntime {
     }
 
     pub fn catalog_if_connected(&self) -> Option<VirtualHidProfileCatalog> {
-        if self.config.host_bridge_required && !self.bridge_healthy() {
-            return None;
-        }
-        if !self
-            .identity
-            .lock()
-            .is_ok_and(|identity| identity.can_advertise(self.config.host_bridge_required))
-        {
-            return None;
-        }
-        self.catalog.lock().ok().and_then(|catalog| catalog.clone())
+        self.catalog()
     }
 
+    /// Enumeration only reads a coherent published snapshot. It never connects
+    /// or destroys a bridge, even when a previous session is unhealthy.
     pub fn catalog_result(&self) -> Result<Option<VirtualHidProfileCatalog>, GuestDriverError> {
-        if self.config.host_bridge_required && !self.ensure_connected_result()? {
+        let state = self
+            .connection
+            .lock()
+            .map_err(|_| GuestDriverError::StatePoisoned("connection"))?;
+        if self.config.host_bridge_required && !Self::state_bridge_healthy(&state) {
             return Ok(None);
         }
-        if !self
+        if !state
             .identity
-            .lock()
-            .is_ok_and(|identity| identity.can_advertise(self.config.host_bridge_required))
+            .can_advertise(self.config.host_bridge_required)
         {
             return Ok(None);
         }
-        self.catalog
-            .lock()
-            .map(|catalog| catalog.clone())
-            .map_err(|_| GuestDriverError::StatePoisoned("catalog"))
+        Ok(state.catalog.clone())
     }
 
     pub fn can_advertise(&self) -> bool {
-        if self.config.host_bridge_required && !self.ensure_connected() {
-            return false;
-        }
-        self.identity
-            .lock()
-            .is_ok_and(|identity| identity.can_advertise(self.config.host_bridge_required))
+        self.catalog().is_some()
     }
 
     pub fn ensure_connected(&self) -> bool {
@@ -154,90 +192,199 @@ impl GuestDriverRuntime {
     }
 
     pub fn ensure_connected_result(&self) -> Result<bool, GuestDriverError> {
-        if !self.config.host_bridge_enabled {
-            return Ok(false);
-        }
-
-        if self.bridge_healthy() {
-            return Ok(true);
-        }
-        let reconnect_interval = self.effective_reconnect_interval();
-        self.clear_bridge("stale or missing bridge");
-
-        if !self.should_attempt_connect(reconnect_interval) {
-            return Ok(false);
-        }
-
-        self.connect_bridge().map(|()| true)
+        self.wake.notify_one(); // requests coalesce; they cannot bypass the retry deadline
+        let state = self
+            .connection
+            .lock()
+            .map_err(|_| GuestDriverError::StatePoisoned("connection"))?;
+        Ok(self.config.host_bridge_enabled && Self::state_bridge_healthy(&state))
     }
 
+    /// Compatibility entry point: connection attempts belong exclusively to the worker.
     pub fn connect_bridge(&self) -> Result<(), GuestDriverError> {
-        let bridge = Arc::new(HostBridge::connect(self.config.host_bridge_config())?);
-        let identity_payload = bridge.info().identity.clone();
-        let allow_debug_fallback =
-            self.allow_debug_fallback_with_overrides(&bridge.info().guest_runtime_overrides);
-        let catalog =
-            VirtualHidProfileCatalog::from_identity(&identity_payload, allow_debug_fallback);
-        self.apply_trace_overrides(&bridge.info().guest_runtime_overrides)?;
-
-        *self
-            .identity
-            .lock()
-            .map_err(|_| GuestDriverError::StatePoisoned("identity"))? = {
-            let mut identity = RuntimeIdentity::new(allow_debug_fallback);
-            identity.set_host_identity(identity_payload);
-            identity
-        };
-        *self
-            .catalog
-            .lock()
-            .map_err(|_| GuestDriverError::StatePoisoned("catalog"))? = Some(catalog);
-        *self
-            .bridge
-            .lock()
-            .map_err(|_| GuestDriverError::StatePoisoned("bridge"))? = Some(bridge);
-        Ok(())
+        if self.ensure_connected_result()? {
+            Ok(())
+        } else {
+            Err(GuestDriverError::DeviceNotConnected)
+        }
     }
 
     pub fn clear_bridge(&self, _reason: &'static str) {
-        let removed_bridge = self.bridge.lock().ok().and_then(|mut bridge| bridge.take());
-        drop(removed_bridge);
-        self.reset_trace_limiter();
-        self.mark_bridge_stale();
+        if let Ok(mut state) = self.connection.lock() {
+            state.epoch = state.epoch.wrapping_add(1);
+            self.retire_bridge(&mut state);
+        }
+        self.wake.notify_one();
     }
 
-    fn clear_bridge_if_current(&self, current_bridge: &Arc<HostBridge>, _reason: &'static str) {
-        let removed_bridge = self.bridge.lock().ok().and_then(|mut bridge| {
-            if bridge
+    pub fn device_generation(&self) -> u32 {
+        self.device_generation.load(Ordering::Acquire)
+    }
+
+    fn clear_bridge_if_current(&self, current: &Arc<HostBridge>, _reason: &'static str) {
+        if let Ok(mut state) = self.connection.lock() {
+            if state
+                .bridge
                 .as_ref()
-                .is_some_and(|bridge| Arc::ptr_eq(bridge, current_bridge))
+                .is_some_and(|bridge| Arc::ptr_eq(bridge, current))
             {
-                bridge.take()
-            } else {
-                None
+                state.epoch = state.epoch.wrapping_add(1);
+                self.retire_bridge(&mut state);
             }
+        }
+        self.wake.notify_one();
+    }
+
+    fn retire_bridge(&self, state: &mut ConnectionState) {
+        let removed = state.bridge.take();
+        state.identity.mark_stale();
+        state.catalog = state.identity.identity().map(|identity| {
+            VirtualHidProfileCatalog::from_identity(identity, self.config.allow_debug_fallback())
         });
-        if removed_bridge.is_some() {
-            drop(removed_bridge);
-            self.reset_trace_limiter();
-            self.mark_bridge_stale();
+        self.reset_trace_limiter();
+        if let Some(bridge) = removed {
+            state.retired.push(bridge);
+            self.device_generation.fetch_add(1, Ordering::Release);
         }
     }
 
-    fn mark_bridge_stale(&self) {
-        let next_identity = if let Ok(mut identity) = self.identity.lock() {
-            identity.mark_stale();
-            identity.identity().cloned()
-        } else {
-            None
-        };
-        if let Ok(mut catalog) = self.catalog.lock() {
-            *catalog = next_identity.as_ref().map(|identity| {
-                VirtualHidProfileCatalog::from_identity(
-                    identity,
-                    self.config.allow_debug_fallback(),
-                )
-            });
+    /// Run on an existing attach thread, outside the loader lock. A second call
+    /// is a no-op. Disabled bridges never start a connector.
+    pub fn run_connection_worker(&self, on_change: impl Fn()) {
+        self.run_connection_worker_with(HostBridge::connect, Instant::now, on_change);
+    }
+
+    fn run_connection_worker_with(
+        &self,
+        connect: impl Fn(HostBridgeConfig) -> Result<HostBridge, HostBridgeError>,
+        now: impl Fn() -> Instant,
+        on_change: impl Fn(),
+    ) {
+        let mut state = self.connection.lock().unwrap();
+        if !self.config.host_bridge_enabled || state.worker_running || state.stopping {
+            return;
+        }
+        state.worker_running = true;
+        loop {
+            let mut cleanup = Vec::new();
+            let mut index = 0;
+            while index < state.retired.len() {
+                if Arc::strong_count(&state.retired[index]) == 1 {
+                    cleanup.push(state.retired.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            if state.stopping {
+                self.retire_bridge(&mut state);
+                if state.retired.is_empty() {
+                    drop(state);
+                    drop(cleanup); // join outside shared state lock
+                    state = self.connection.lock().unwrap();
+                    state.worker_running = false;
+                    self.wake.notify_all();
+                    return;
+                }
+            }
+            let mut changed = false;
+            if state.bridge.is_some() && !Self::state_bridge_healthy(&state) {
+                self.retire_bridge(&mut state);
+                changed = true;
+            }
+            let remaining = state.retry.remaining(now());
+            if !state.stopping && state.bridge.is_none() && !state.connecting && remaining.is_zero()
+            {
+                state.connecting = true;
+                let epoch = state.epoch;
+                drop(state);
+                drop(cleanup);
+                if changed {
+                    on_change();
+                }
+                let result = connect(self.config.host_bridge_config());
+                state = self.connection.lock().unwrap();
+                state.connecting = false;
+                // A failed attempt's duration must not consume the retry interval.
+                let interval = state.reconnect_interval;
+                state.retry.failed_at(now(), interval);
+                match result {
+                    Ok(bridge) => {
+                        let bridge = Arc::new(bridge);
+                        if state.stopping || state.epoch != epoch {
+                            state.retired.push(bridge);
+                        } else {
+                            let overrides = &bridge.info().guest_runtime_overrides;
+                            let allow_fallback =
+                                self.allow_debug_fallback_with_overrides(overrides);
+                            let catalog = VirtualHidProfileCatalog::from_identity(
+                                &bridge.info().identity,
+                                allow_fallback,
+                            );
+                            let mut identity = RuntimeIdentity::new(allow_fallback);
+                            identity.set_host_identity(bridge.info().identity.clone());
+                            let _ = self.apply_trace_overrides(overrides);
+                            state.reconnect_interval =
+                                self.reconnect_interval_with_overrides(overrides);
+                            state.identity = identity;
+                            state.catalog = Some(catalog);
+                            state.bridge = Some(bridge);
+                            state.retry = RetrySchedule::default();
+                            state.last_error = None;
+                            self.device_generation.fetch_add(1, Ordering::Release);
+                        }
+                    }
+                    Err(error) => {
+                        state.last_error = Some(error.to_string());
+                        // Host overrides only survive through the first retry after disconnect.
+                        state.reconnect_interval = self.config.lazy_reconnect_interval;
+                    }
+                }
+                drop(state);
+                on_change();
+                state = self.connection.lock().unwrap();
+                continue;
+            }
+            // Health checks detect disconnect without any SDL or HID polling.
+            let wait = if state.bridge.is_some() || state.stopping {
+                Duration::from_millis(50)
+            } else {
+                remaining.min(Duration::from_millis(50))
+            };
+            drop(state);
+            drop(cleanup);
+            if changed {
+                on_change();
+            }
+            state = self.connection.lock().unwrap();
+            if state.stopping && state.retired.is_empty() {
+                continue;
+            }
+            state = self.wake.wait_timeout(state, wait).unwrap().0;
+        }
+    }
+
+    pub fn connection_error(&self) -> Option<String> {
+        self.connection
+            .lock()
+            .ok()
+            .and_then(|state| state.last_error.clone())
+    }
+
+    /// Signal only; safe callers do not wait for handshake or bridge teardown.
+    pub fn request_connection_worker_stop(&self) {
+        if let Ok(mut state) = self.connection.lock() {
+            state.stopping = true;
+            state.epoch = state.epoch.wrapping_add(1);
+        }
+        self.wake.notify_all();
+    }
+
+    /// Explicit shutdown outside DllMain. Process termination must never call this.
+    pub fn stop_connection_worker(&self) {
+        self.request_connection_worker_stop();
+        let mut state = self.connection.lock().unwrap();
+        while state.worker_running {
+            state = self.wake.wait(state).unwrap();
         }
     }
 
@@ -292,8 +439,7 @@ impl GuestDriverRuntime {
         profile: VirtualHidProfile,
         output: &mut [u8],
     ) -> Result<Option<usize>, GuestDriverError> {
-        let interface_number = self.connected_interface_number(profile)?;
-        self.with_bridge("INPUT", |bridge| {
+        self.with_bridge(profile, "INPUT", |bridge, interface_number| {
             bridge.copy_next_input_report(interface_number, output)
         })
     }
@@ -304,9 +450,8 @@ impl GuestDriverRuntime {
         report_id: u8,
         output: &mut [u8],
     ) -> Result<usize, GuestDriverError> {
-        let interface_number = self.connected_interface_number(profile)?;
         let timeout_ms = self.operation_timeout_ms(DEFAULT_GET_FEATURE_TIMEOUT);
-        self.with_bridge("GET_FEATURE", |bridge| {
+        self.with_bridge(profile, "GET_FEATURE", |bridge, interface_number| {
             bridge.copy_feature_report(interface_number, report_id, output, timeout_ms)
         })
     }
@@ -316,9 +461,8 @@ impl GuestDriverRuntime {
         profile: VirtualHidProfile,
         payload: &[u8],
     ) -> Result<u16, GuestDriverError> {
-        let interface_number = self.connected_interface_number(profile)?;
         let timeout_ms = self.operation_timeout_ms(DEFAULT_SET_FEATURE_TIMEOUT);
-        self.with_bridge("SET_FEATURE", |bridge| {
+        self.with_bridge(profile, "SET_FEATURE", |bridge, interface_number| {
             bridge.set_feature(interface_number, payload, timeout_ms)
         })
     }
@@ -328,9 +472,8 @@ impl GuestDriverRuntime {
         profile: VirtualHidProfile,
         payload: &[u8],
     ) -> Result<u16, GuestDriverError> {
-        let interface_number = self.connected_interface_number(profile)?;
         let timeout_ms = self.operation_timeout_ms(DEFAULT_FEEDBACK_TIMEOUT);
-        self.with_bridge("SET_OUTPUT", |bridge| {
+        self.with_bridge(profile, "SET_OUTPUT", |bridge, interface_number| {
             bridge.set_output(interface_number, payload, timeout_ms)
         })
     }
@@ -340,9 +483,8 @@ impl GuestDriverRuntime {
         profile: VirtualHidProfile,
         payload: &[u8],
     ) -> Result<u16, GuestDriverError> {
-        let interface_number = self.connected_interface_number(profile)?;
         let timeout_ms = self.operation_timeout_ms(DEFAULT_FEEDBACK_TIMEOUT);
-        self.with_bridge("WRITE", |bridge| {
+        self.with_bridge(profile, "WRITE", |bridge, interface_number| {
             bridge.write_report(interface_number, payload, timeout_ms)
         })
     }
@@ -355,56 +497,42 @@ impl GuestDriverRuntime {
     }
 
     fn profile_available(&self, profile: VirtualHidProfile) -> bool {
-        self.catalog
-            .lock()
-            .ok()
-            .and_then(|catalog| {
-                catalog
-                    .as_ref()
-                    .map(|catalog| catalog.descriptor(profile).is_some())
-            })
-            .unwrap_or(false)
-    }
-
-    fn interface_number(&self, profile: VirtualHidProfile) -> Result<u8, GuestDriverError> {
-        self.catalog
-            .lock()
-            .map_err(|_| GuestDriverError::StatePoisoned("catalog"))?
-            .as_ref()
-            .and_then(|catalog| {
-                catalog
-                    .descriptor(profile)
-                    .map(|descriptor| descriptor.interface_number)
-            })
-            .ok_or(GuestDriverError::ProfileUnavailable(profile))
-    }
-
-    fn connected_interface_number(
-        &self,
-        profile: VirtualHidProfile,
-    ) -> Result<u8, GuestDriverError> {
-        if !self.ensure_connected() {
-            return Err(GuestDriverError::DeviceNotConnected);
-        }
-        self.interface_number(profile)
+        self.connection.lock().ok().is_some_and(|state| {
+            state
+                .catalog
+                .as_ref()
+                .is_some_and(|catalog| catalog.descriptor(profile).is_some())
+        })
     }
 
     fn with_bridge<T>(
         &self,
+        profile: VirtualHidProfile,
         operation: &'static str,
-        call: impl FnOnce(&HostBridge) -> Result<T, HostBridgeError>,
+        call: impl FnOnce(&HostBridge, u8) -> Result<T, HostBridgeError>,
     ) -> Result<T, GuestDriverError> {
-        if !self.ensure_connected() {
-            return Err(GuestDriverError::DeviceNotConnected);
-        }
-        let bridge = self
-            .bridge
-            .lock()
-            .map_err(|_| GuestDriverError::StatePoisoned("bridge"))?
-            .as_ref()
-            .cloned()
-            .ok_or(GuestDriverError::DeviceNotConnected)?;
-        let result = call(&bridge);
+        // Route and bridge must come from the same session, even if the worker
+        // publishes a different PID/interface immediately after this lock.
+        let (bridge, interface_number) = {
+            let state = self
+                .connection
+                .lock()
+                .map_err(|_| GuestDriverError::StatePoisoned("connection"))?;
+            if !self.config.host_bridge_enabled || !Self::state_bridge_healthy(&state) {
+                return Err(GuestDriverError::DeviceNotConnected);
+            }
+            let interface_number = state
+                .catalog
+                .as_ref()
+                .and_then(|catalog| {
+                    catalog
+                        .descriptor(profile)
+                        .map(|descriptor| descriptor.interface_number)
+                })
+                .ok_or(GuestDriverError::ProfileUnavailable(profile))?;
+            (state.bridge.as_ref().unwrap().clone(), interface_number)
+        };
+        let result = call(&bridge, interface_number);
         match result {
             Ok(value) => Ok(value),
             Err(error) => {
@@ -414,18 +542,6 @@ impl GuestDriverRuntime {
                 Err(error.into())
             }
         }
-    }
-
-    fn should_attempt_connect(&self, reconnect_interval: Duration) -> bool {
-        let now = Instant::now();
-        let Ok(mut last_attempt) = self.last_connect_attempt.lock() else {
-            return false;
-        };
-        if last_attempt.is_some_and(|last| now.duration_since(last) < reconnect_interval) {
-            return false;
-        }
-        *last_attempt = Some(now);
-        true
     }
 
     fn operation_timeout_ms(&self, default_timeout: Duration) -> u16 {
@@ -471,10 +587,6 @@ impl GuestDriverRuntime {
                 .unwrap_or(self.config.replay_enabled)
     }
 
-    fn effective_reconnect_interval(&self) -> Duration {
-        self.reconnect_interval_with_overrides(&self.guest_runtime_overrides())
-    }
-
     fn reconnect_interval_with_overrides(&self, overrides: &GuestRuntimeOverrides) -> Duration {
         overrides
             .reconnect_interval_ms
@@ -492,12 +604,10 @@ impl GuestDriverRuntime {
         }
     }
 
-    fn bridge_healthy(&self) -> bool {
-        self.bridge.lock().is_ok_and(|bridge| {
-            bridge.as_ref().is_some_and(|bridge| {
-                let stats = bridge.input_stats();
-                stats.read_errors == 0 && stats.command_errors == 0
-            })
+    fn state_bridge_healthy(state: &ConnectionState) -> bool {
+        state.bridge.as_ref().is_some_and(|bridge| {
+            let stats = bridge.input_stats();
+            stats.read_errors == 0 && stats.command_errors == 0
         })
     }
 }
@@ -554,6 +664,71 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    struct TestWorker {
+        runtime: Arc<GuestDriverRuntime>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestWorker {
+        fn start(runtime: Arc<GuestDriverRuntime>) -> Self {
+            let worker_runtime = runtime.clone();
+            let thread = thread::spawn(move || worker_runtime.run_connection_worker(|| {}));
+            Self {
+                runtime,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for TestWorker {
+        fn drop(&mut self) {
+            self.runtime.stop_connection_worker();
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+
+    fn wait_until(predicate: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !predicate() {
+            assert!(Instant::now() < deadline, "worker did not publish state");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn catalog_query_does_not_wait_for_unresponsive_host() {
+        let listeners = TransportListeners::bind(TransportAddrs::loopback(0, 0)).unwrap();
+        let runtime = Arc::new(GuestDriverRuntime::new(RuntimeConfig {
+            addrs: listeners.local_addrs().unwrap(),
+            ..RuntimeConfig::driver_defaults()
+        }));
+        let _worker = TestWorker::start(runtime.clone());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut control = listeners.accept_control().unwrap();
+            control.read_frame().unwrap();
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let (result_tx, result_rx) = mpsc::channel();
+        let caller_runtime = runtime.clone();
+        let caller = thread::spawn(move || {
+            result_tx.send(caller_runtime.catalog_result()).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The server cannot finish the handshake until after the query returns.
+        // This timeout is a deadlock watchdog, not a millisecond performance budget.
+        let result = result_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        caller.join().unwrap();
+        server.join().unwrap();
+        assert!(
+            matches!(result, Ok(Ok(None))),
+            "query waited for handshake: {result:?}"
+        );
+    }
+
     #[test]
     fn required_mode_starts_without_advertised_profiles() {
         let runtime = GuestDriverRuntime::new(RuntimeConfig {
@@ -602,12 +777,14 @@ mod tests {
     fn stale_bridge_clears_required_catalog() {
         let runtime = GuestDriverRuntime::new(RuntimeConfig::default());
         {
-            let mut identity = runtime.identity.lock().unwrap();
-            identity.set_host_identity(default_fallback_identity());
+            let mut state = runtime.connection.lock().unwrap();
+            state
+                .identity
+                .set_host_identity(default_fallback_identity());
         }
         {
-            let mut catalog = runtime.catalog.lock().unwrap();
-            *catalog = Some(VirtualHidProfileCatalog::from_identity(
+            let mut state = runtime.connection.lock().unwrap();
+            state.catalog = Some(VirtualHidProfileCatalog::from_identity(
                 &default_fallback_identity(),
                 false,
             ));
@@ -616,6 +793,7 @@ mod tests {
         runtime.clear_bridge("test");
 
         assert!(runtime.catalog().is_none());
+        assert_eq!(runtime.device_generation(), 0);
         assert!(!runtime.can_advertise());
     }
 
@@ -640,12 +818,12 @@ mod tests {
             ..RuntimeConfig::default()
         });
         {
-            let mut identity = runtime.identity.lock().unwrap();
-            identity.set_host_identity(host_identity.clone());
+            let mut state = runtime.connection.lock().unwrap();
+            state.identity.set_host_identity(host_identity.clone());
         }
         {
-            let mut catalog = runtime.catalog.lock().unwrap();
-            *catalog = Some(VirtualHidProfileCatalog::from_identity(
+            let mut state = runtime.connection.lock().unwrap();
+            state.catalog = Some(VirtualHidProfileCatalog::from_identity(
                 &host_identity,
                 true,
             ));
@@ -793,8 +971,11 @@ mod tests {
             host_bridge_required: true,
             ..RuntimeConfig::default()
         });
-        runtime.connect_bridge().unwrap();
+        let runtime = Arc::new(runtime);
+        let _worker = TestWorker::start(runtime.clone());
+        wait_until(|| runtime.device_generation() == 1);
 
+        assert_eq!(runtime.device_generation(), 1);
         assert_eq!(
             runtime.operation_timeout_ms(DEFAULT_GET_FEATURE_TIMEOUT),
             75
@@ -807,6 +988,7 @@ mod tests {
 
         runtime.clear_bridge("test");
 
+        assert_eq!(runtime.device_generation(), 2);
         assert_eq!(
             runtime.operation_timeout_ms(DEFAULT_GET_FEATURE_TIMEOUT),
             100
@@ -896,7 +1078,8 @@ mod tests {
             io_timeout: Duration::from_millis(250),
             ..RuntimeConfig::default()
         }));
-        runtime.connect_bridge().unwrap();
+        let _worker = TestWorker::start(runtime.clone());
+        wait_until(|| runtime.device_generation() == 1);
 
         let writer_runtime = Arc::clone(&runtime);
         let writer = thread::spawn(move || {
@@ -940,3 +1123,7 @@ mod tests {
             .unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_connectivity_tests.rs"]
+mod connectivity_tests;
