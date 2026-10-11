@@ -7,9 +7,12 @@ use crosspuck_core::guest_driver::RuntimeConfig;
 use std::ffi::c_void;
 use std::panic;
 use windows_sys::core::BOOL;
-use windows_sys::Win32::Foundation::{HINSTANCE, TRUE};
-use windows_sys::Win32::System::LibraryLoader::DisableThreadLibraryCalls;
-use windows_sys::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
+use windows_sys::Win32::Foundation::{FALSE, HINSTANCE, TRUE};
+use windows_sys::Win32::System::LibraryLoader::{
+    DisableThreadLibraryCalls, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+    GET_MODULE_HANDLE_EX_FLAG_PIN,
+};
+use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 
 #[no_mangle]
 pub unsafe extern "system" fn DllMain(
@@ -19,19 +22,35 @@ pub unsafe extern "system" fn DllMain(
 ) -> BOOL {
     match reason {
         DLL_PROCESS_ATTACH => {
+            // Hooks and the attach worker execute DLL code for the process lifetime.
+            // Pin before spawning, so FreeLibrary cannot race their initialization.
+            let mut module = std::ptr::null_mut();
+            if GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                DllMain as *const () as *const u16,
+                &mut module,
+            ) == 0
+            {
+                return FALSE;
+            }
             DisableThreadLibraryCalls(hinst);
             std::thread::spawn(|| {
                 let _ = panic::catch_unwind(attach);
             });
         }
-        DLL_PROCESS_DETACH => {
-            if let Some(runtime) = state::runtime() {
-                runtime.clear_bridge("dll detach");
-            }
-        }
         _ => {}
     }
+    // No locks, network work, bridge drops or joins during process detach.
     TRUE
+}
+
+/// Optional explicit shutdown for callers outside the loader lock. The pinned
+/// module and hooks remain valid; process detach never calls this blocking path.
+#[no_mangle]
+pub extern "system" fn CrossPuckShutdown() {
+    if let Some(runtime) = state::runtime() {
+        runtime.stop_connection_worker();
+    }
 }
 
 fn attach() {
@@ -51,7 +70,8 @@ fn attach() {
                 .map(|name| name.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| "<unknown>".to_string());
-    let bridge_connect_allowed = process.eq_ignore_ascii_case("steam.exe");
+    let bridge_connect_allowed =
+        crate::connectivity::connection_worker_allowed(&process, host_bridge_enabled);
     if !state::init_runtime(config, bridge_connect_allowed) {
         debug_line("[crosspuck] driver runtime already initialized");
         return;
@@ -76,4 +96,5 @@ fn attach() {
         "[crosspuck] driver timeouts connect_ms={} handshake_ms={} io_ms={} reconnect_ms={}",
         connect_timeout_ms, handshake_timeout_ms, io_timeout_ms, reconnect_interval_ms
     ));
+    state::run_connection_worker();
 }

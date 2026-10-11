@@ -31,6 +31,10 @@ const USER_REG_FILE_NAME: &str = "user.reg";
 const USER_REG_DLL_OVERRIDES_SECTION: &str = r"[Software\\Wine\\DllOverrides]";
 const USER_REG_HID_OVERRIDE_NAME: &str = "hid";
 const CX_BOTTLE_CONF_FILE_NAME: &str = "cxbottle.conf";
+const CX_BOTTLE_CONF_ENV_SECTION: &str = "[EnvironmentVariables]";
+const SDL_IGNORE_DEVICES_ENV_NAME: &str = "\"SDL_GAMECONTROLLER_IGNORE_DEVICES\"";
+const SDL_IGNORE_DUPLICATE_XINPUT_LINE: &str =
+    "\"SDL_GAMECONTROLLER_IGNORE_DEVICES\" = \"0x05AC/0x0004\"";
 const CROSSOVER_APP_PATH: &str = "/Applications/CrossOver.app";
 const CROSSOVER_PREVIEW_APP_PATH: &str = "/Applications/CrossOver Preview.app";
 const CROSSOVER_HOSTED_WINE_RELATIVE_PATH: &[&str] = &[
@@ -725,6 +729,90 @@ fn bottle_prefers_preview(bottle_path: &Path) -> bool {
     })
 }
 
+pub fn duplicate_xinput_hidden(bottle_path: &Path) -> bool {
+    fs::read_to_string(bottle_path.join(CX_BOTTLE_CONF_FILE_NAME))
+        .is_ok_and(|config| cx_bottle_conf_hides_duplicate_xinput(&config))
+}
+
+pub fn set_duplicate_xinput_hidden(
+    bottle_path: &Path,
+    hidden: bool,
+) -> Result<(), DriverInstallError> {
+    let path = bottle_path.join(CX_BOTTLE_CONF_FILE_NAME);
+    let config = fs::read_to_string(&path).map_err(|source| DriverInstallError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let updated = cx_bottle_conf_with_duplicate_xinput_hidden(&config, hidden);
+    if updated == config {
+        return Ok(());
+    }
+    fs::write(&path, updated).map_err(|source| DriverInstallError::Io { path, source })
+}
+
+fn cx_bottle_conf_hides_duplicate_xinput(config: &str) -> bool {
+    cx_bottle_conf_env_lines(config).any(|line| line.trim() == SDL_IGNORE_DUPLICATE_XINPUT_LINE)
+}
+
+fn cx_bottle_conf_env_lines(config: &str) -> impl Iterator<Item = &str> {
+    config
+        .lines()
+        .skip_while(|line| line.trim() != CX_BOTTLE_CONF_ENV_SECTION)
+        .skip(1)
+        .take_while(|line| !line.trim_start().starts_with('['))
+}
+
+fn cx_bottle_conf_with_duplicate_xinput_hidden(config: &str, hidden: bool) -> String {
+    let mut lines = config.lines().map(str::to_string).collect::<Vec<_>>();
+    let Some(section_start) = lines
+        .iter()
+        .position(|line| line.trim() == CX_BOTTLE_CONF_ENV_SECTION)
+    else {
+        if !hidden {
+            return config.to_string();
+        }
+        let separator = if config.is_empty() || config.ends_with("\n\n") {
+            ""
+        } else if config.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        return format!(
+            "{config}{separator}{CX_BOTTLE_CONF_ENV_SECTION}\n{SDL_IGNORE_DUPLICATE_XINPUT_LINE}\n"
+        );
+    };
+
+    let section_end = lines[section_start + 1..]
+        .iter()
+        .position(|line| line.trim_start().starts_with('['))
+        .map_or(lines.len(), |offset| section_start + 1 + offset);
+    let mut section = lines
+        .drain(section_start + 1..section_end)
+        .filter(|line| {
+            if hidden {
+                !line.trim_start().starts_with(SDL_IGNORE_DEVICES_ENV_NAME)
+            } else {
+                line.trim() != SDL_IGNORE_DUPLICATE_XINPUT_LINE
+            }
+        })
+        .collect::<Vec<_>>();
+    if hidden {
+        let insert_at = section
+            .iter()
+            .rposition(|line| line.trim_start().starts_with('"'))
+            .map_or(0, |index| index + 1);
+        section.insert(insert_at, SDL_IGNORE_DUPLICATE_XINPUT_LINE.to_string());
+    }
+    lines.splice(section_start + 1..section_start + 1, section);
+
+    let mut updated = lines.join("\n");
+    if config.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated
+}
+
 fn is_crossover_preview_app(path: &Path) -> bool {
     path.file_name()
         .and_then(OsStr::to_str)
@@ -1230,6 +1318,75 @@ mod tests {
         assert!(!result.target_dll.exists());
         assert!(result.registry_targets.is_empty());
         assert_eq!(fs::read_to_string(user_reg_path(&bottle)).unwrap(), before);
+    }
+
+    #[test]
+    fn hiding_duplicate_xinput_adds_env_line_after_existing_variables() {
+        let config = "[Bottle]\n\"Preview\" = \"1\"\n\n[EnvironmentVariables]\n\"WINEMSYNC\" = \"1\"\n;;\"PROMPT\" = \"$p$g\"\n\n[Other]\n\"kept\" = \"yes\"\n";
+
+        let updated = cx_bottle_conf_with_duplicate_xinput_hidden(config, true);
+
+        assert_eq!(
+            updated,
+            "[Bottle]\n\"Preview\" = \"1\"\n\n[EnvironmentVariables]\n\"WINEMSYNC\" = \"1\"\n\"SDL_GAMECONTROLLER_IGNORE_DEVICES\" = \"0x05AC/0x0004\"\n;;\"PROMPT\" = \"$p$g\"\n\n[Other]\n\"kept\" = \"yes\"\n"
+        );
+        assert!(cx_bottle_conf_hides_duplicate_xinput(&updated));
+        assert_eq!(
+            cx_bottle_conf_with_duplicate_xinput_hidden(&updated, true),
+            updated
+        );
+        assert_eq!(
+            cx_bottle_conf_with_duplicate_xinput_hidden(&updated, false),
+            config
+        );
+    }
+
+    #[test]
+    fn hiding_duplicate_xinput_replaces_custom_ignore_list() {
+        let config =
+            "[EnvironmentVariables]\n\"SDL_GAMECONTROLLER_IGNORE_DEVICES\" = \"0x045E/0x028E\"\n";
+
+        assert!(!cx_bottle_conf_hides_duplicate_xinput(config));
+        assert_eq!(
+            cx_bottle_conf_with_duplicate_xinput_hidden(config, false),
+            config
+        );
+        assert_eq!(
+            cx_bottle_conf_with_duplicate_xinput_hidden(config, true),
+            "[EnvironmentVariables]\n\"SDL_GAMECONTROLLER_IGNORE_DEVICES\" = \"0x05AC/0x0004\"\n"
+        );
+    }
+
+    #[test]
+    fn hiding_duplicate_xinput_creates_missing_env_section() {
+        let config = "[Bottle]\n\"Preview\" = \"1\"\n";
+
+        assert_eq!(
+            cx_bottle_conf_with_duplicate_xinput_hidden(config, true),
+            "[Bottle]\n\"Preview\" = \"1\"\n\n[EnvironmentVariables]\n\"SDL_GAMECONTROLLER_IGNORE_DEVICES\" = \"0x05AC/0x0004\"\n"
+        );
+        assert_eq!(
+            cx_bottle_conf_with_duplicate_xinput_hidden(config, false),
+            config
+        );
+    }
+
+    #[test]
+    fn duplicate_xinput_toggle_round_trips_bottle_config() {
+        let dir = TestDir::new("duplicate-xinput");
+        let bottle = write_bottle_with_steam(dir.path(), DEFAULT_STEAM_BOTTLE_NAME);
+        let config = "[EnvironmentVariables]\n\"WINEMSYNC\" = \"1\"\n";
+        fs::write(bottle.join(CX_BOTTLE_CONF_FILE_NAME), config).unwrap();
+
+        assert!(!duplicate_xinput_hidden(&bottle));
+        set_duplicate_xinput_hidden(&bottle, true).unwrap();
+        assert!(duplicate_xinput_hidden(&bottle));
+        set_duplicate_xinput_hidden(&bottle, false).unwrap();
+        assert!(!duplicate_xinput_hidden(&bottle));
+        assert_eq!(
+            fs::read_to_string(bottle.join(CX_BOTTLE_CONF_FILE_NAME)).unwrap(),
+            config
+        );
     }
 
     #[test]

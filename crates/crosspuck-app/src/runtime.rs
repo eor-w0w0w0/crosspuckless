@@ -2,7 +2,7 @@ use crate::hid_backend::{
     set_host_log_session_trace_id, HostBackend, HostHidError, RealHostBackend,
 };
 use crate::user_activity::UserActivityReporter;
-use crosspuck_core::hid::{snapshot_for_filter, HidFilter};
+use crosspuck_core::hid::{session_snapshots_for_known_modes, ConnectionMode, PuckSnapshot};
 use crosspuck_core::protocol::{
     session_trace_label, Frame, FrameIoError, GetFeature, GuestRuntimeOverrides, Hello, HelloOk,
     IdentityPayload, InputAttach, InputAttachOk, InputReport, MessageType, ProtocolError,
@@ -33,12 +33,14 @@ pub enum HostRuntimeState {
     PuckDisconnected,
     PuckConnected {
         serial: String,
+        mode: ConnectionMode,
     },
     GuestConnected {
         session_id: u32,
         session_trace_id: u32,
         serial: String,
         guest_pid: u32,
+        mode: ConnectionMode,
     },
     Degraded {
         reason: String,
@@ -59,17 +61,21 @@ impl HostRuntimeState {
                 &format!("{control_addr}, {input_addr}"),
                 "-",
             ),
-            Self::PuckDisconnected => MenuView::new("Puck disconnected", "-", "-", "-"),
-            Self::PuckConnected { serial } => {
-                MenuView::new("Puck connected", serial.as_str(), "-", "-")
-            }
+            Self::PuckDisconnected => MenuView::new("Controller disconnected", "-", "-", "-"),
+            Self::PuckConnected { serial, mode } => MenuView::new(
+                &format!("{} connected", mode.label()),
+                serial.as_str(),
+                "-",
+                "-",
+            ),
             Self::GuestConnected {
                 session_id,
                 session_trace_id,
                 serial,
                 guest_pid,
+                mode,
             } => MenuView::new(
-                "Guest proxy connected",
+                &format!("Guest proxy connected ({})", mode.label()),
                 serial.as_str(),
                 &format!(
                     "pid={guest_pid}, session={}, id={session_id}",
@@ -105,12 +111,14 @@ impl MenuView {
 #[derive(Clone, Debug)]
 pub struct AppState {
     state: Arc<Mutex<HostRuntimeState>>,
+    force_reconnect: Arc<AtomicBool>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(HostRuntimeState::Starting)),
+            force_reconnect: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -121,6 +129,18 @@ impl AppState {
             .unwrap_or_else(|_| HostRuntimeState::Degraded {
                 reason: "state lock poisoned".to_string(),
             })
+    }
+
+    pub fn request_reconnect(&self) {
+        self.force_reconnect.store(true, Ordering::Relaxed);
+    }
+
+    fn take_reconnect_request(&self) -> bool {
+        self.force_reconnect.swap(false, Ordering::Relaxed)
+    }
+
+    fn clear_reconnect_request(&self) {
+        self.force_reconnect.store(false, Ordering::Relaxed);
     }
 
     fn set(&self, state: HostRuntimeState) {
@@ -298,11 +318,19 @@ fn run_accept_loop(
             stop,
         ) {
             Ok(()) => {}
-            Err(RuntimeError::DeviceUnavailable(_)) => {
-                app_state.set(HostRuntimeState::PuckDisconnected);
+            Err(RuntimeError::DeviceUnavailable(reason)) => {
+                log::warn!(
+                    "CrossPuck[{}] session device unavailable: {reason}",
+                    session_trace_label(session_trace_id)
+                );
+                app_state.set(HostRuntimeState::Degraded { reason });
             }
             Err(error) if stop.load(Ordering::Relaxed) && error.is_timeout() => {}
             Err(error) => {
+                log::warn!(
+                    "CrossPuck[{}] session failed: {error}",
+                    session_trace_label(session_trace_id)
+                );
                 app_state.set(HostRuntimeState::Degraded {
                     reason: format!("session failed: {error}"),
                 });
@@ -315,9 +343,15 @@ fn refresh_idle_puck_state(listeners: &TransportListeners, app_state: &AppState)
     if listeners.local_addrs().is_err() {
         return;
     }
-    match with_worker_autorelease_pool(|| snapshot_for_filter(&HidFilter::steam_puck())) {
-        Ok(snapshot) => app_state.set(HostRuntimeState::PuckConnected {
+    match with_worker_autorelease_pool(|| {
+        session_snapshots_for_known_modes()?
+            .into_iter()
+            .next()
+            .ok_or(crosspuck_core::hid::HidSnapshotError::MissingCollections)
+    }) {
+        Ok((mode, snapshot)) => app_state.set(HostRuntimeState::PuckConnected {
             serial: snapshot.identity.serial,
+            mode,
         }),
         Err(_) => app_state.set(HostRuntimeState::PuckDisconnected),
     }
@@ -332,6 +366,88 @@ fn handle_session(
     app_state: &AppState,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), RuntimeError> {
+    handle_session_selecting_backend(
+        listeners,
+        control,
+        SessionConfig {
+            session_id,
+            session_trace_id,
+            guest_runtime_overrides,
+        },
+        app_state,
+        stop,
+        || {
+            with_worker_autorelease_pool(|| {
+                let candidates =
+                    session_snapshots_for_known_modes().map_err(|error| error.to_string())?;
+                prepare_session_backend(candidates, |mode, snapshot| {
+                    RealHostBackend::new(mode, snapshot)
+                        .map(|backend| Arc::new(backend) as Arc<dyn HostBackend>)
+                })
+            })
+        },
+    )
+}
+
+struct SessionConfig {
+    session_id: u32,
+    session_trace_id: u32,
+    guest_runtime_overrides: GuestRuntimeOverrides,
+}
+
+struct PreparedSession<B> {
+    mode: ConnectionMode,
+    identity: IdentityPayload,
+    backend: B,
+}
+
+fn prepare_session_backend<B, E: std::fmt::Display>(
+    candidates: impl IntoIterator<Item = (ConnectionMode, PuckSnapshot)>,
+    mut open: impl FnMut(ConnectionMode, PuckSnapshot) -> Result<B, E>,
+) -> Result<PreparedSession<B>, String> {
+    let mut failures = Vec::new();
+    for (mode, snapshot) in candidates {
+        let identity = match IdentityPayload::try_from(&snapshot) {
+            Ok(identity) => identity,
+            Err(error) => {
+                failures.push(format!("{} identity: {error}", mode.label()));
+                continue;
+            }
+        };
+        match open(mode, snapshot) {
+            Ok(backend) => {
+                return Ok(PreparedSession {
+                    mode,
+                    identity,
+                    backend,
+                })
+            }
+            Err(error) => {
+                let reason = format!("{} backend: {error}", mode.label());
+                log::warn!("CrossPuck skipping unavailable candidate: {reason}");
+                failures.push(reason);
+            }
+        }
+    }
+    if failures.is_empty() {
+        failures.push("no usable main HID collection".into());
+    }
+    Err(failures.join("; "))
+}
+
+fn handle_session_selecting_backend(
+    listeners: &TransportListeners,
+    control: &mut ChannelStream,
+    config: SessionConfig,
+    app_state: &AppState,
+    stop: &Arc<AtomicBool>,
+    select_backend: impl FnOnce() -> Result<PreparedSession<Arc<dyn HostBackend>>, String>,
+) -> Result<(), RuntimeError> {
+    let SessionConfig {
+        session_id,
+        session_trace_id,
+        guest_runtime_overrides,
+    } = config;
     let hello_frame = control.read_frame()?;
     if hello_frame.header.message_type != MessageType::Hello {
         return Err(RuntimeError::UnexpectedMessage {
@@ -349,45 +465,39 @@ fn handle_session(
         ));
     }
 
-    let snapshot =
-        match with_worker_autorelease_pool(|| snapshot_for_filter(&HidFilter::steam_puck())) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                app_state.set(HostRuntimeState::PuckDisconnected);
-                let hello_ok = hello_ok_with_status(
-                    StatusCode::DeviceDisconnected,
-                    session_id,
-                    session_trace_id,
-                    0,
-                );
-                write_payload(control, hello_frame.header.id, &hello_ok)?;
-                return Err(RuntimeError::DeviceUnavailable(error.to_string()));
-            }
-        };
-    let identity = IdentityPayload::try_from(&snapshot)?;
+    app_state.clear_reconnect_request();
+    let PreparedSession {
+        mode,
+        identity,
+        backend,
+    } = match select_backend() {
+        Ok(prepared) => prepared,
+        Err(reason) => {
+            app_state.set(HostRuntimeState::Degraded {
+                reason: reason.clone(),
+            });
+            let hello_ok = hello_ok_with_status(
+                StatusCode::DeviceDisconnected,
+                session_id,
+                session_trace_id,
+                0,
+            );
+            write_payload(control, hello_frame.header.id, &hello_ok)?;
+            return Err(RuntimeError::DeviceUnavailable(reason));
+        }
+    };
     let session = SessionStart {
         session_id,
         session_trace_id,
         guest_runtime_overrides,
         hello_request_id: hello_frame.header.id,
         guest_pid: hello.guest_pid,
+        mode,
     };
     app_state.set(HostRuntimeState::PuckConnected {
         serial: identity.serial.clone(),
+        mode,
     });
-    let backend = match with_worker_autorelease_pool(|| RealHostBackend::new(snapshot)) {
-        Ok(backend) => Arc::new(backend),
-        Err(error) => {
-            let hello_ok = hello_ok_with_status(
-                StatusCode::DeviceDisconnected,
-                session_id,
-                session_trace_id,
-                identity.default_input_report_len(),
-            );
-            write_payload(control, hello_frame.header.id, &hello_ok)?;
-            return Err(error.into());
-        }
-    };
     write_session_preamble(control, &session, &identity)?;
     let input =
         attach_input_for_session(listeners, stop, INPUT_ATTACH_TIMEOUT, &session, &identity)?;
@@ -401,6 +511,7 @@ struct SessionStart {
     guest_runtime_overrides: GuestRuntimeOverrides,
     hello_request_id: u32,
     guest_pid: u32,
+    mode: ConnectionMode,
 }
 
 #[cfg(test)]
@@ -438,6 +549,7 @@ fn handle_session_with_backend_timeout(
 ) -> Result<(), RuntimeError> {
     app_state.set(HostRuntimeState::PuckConnected {
         serial: identity.serial.clone(),
+        mode: session.mode,
     });
 
     write_session_preamble(control, &session, &identity)?;
@@ -527,19 +639,27 @@ fn run_attached_session(
         session_trace_id: session.session_trace_id,
         serial: identity.serial.clone(),
         guest_pid: session.guest_pid,
+        mode: session.mode,
     });
     set_host_log_session_trace_id(Some(session.session_trace_id));
 
     let input_running = Arc::new(AtomicBool::new(true));
     let input_thread = spawn_input_stream(input, Arc::clone(&backend), Arc::clone(&input_running))?;
-    let control_result =
-        run_control_loop(control, backend.as_ref(), session.session_trace_id, stop);
+    let control_result = run_control_loop(
+        control,
+        backend.as_ref(),
+        session.session_trace_id,
+        app_state,
+        &input_running,
+        stop,
+    );
     input_running.store(false, Ordering::Relaxed);
     let _ = input_thread.join();
     with_worker_autorelease_pool(|| backend.cleanup_feedback());
     set_host_log_session_trace_id(None);
     app_state.set(HostRuntimeState::PuckConnected {
         serial: identity.serial,
+        mode: session.mode,
     });
     control_result
 }
@@ -548,11 +668,21 @@ fn run_control_loop(
     control: &mut ChannelStream,
     backend: &dyn HostBackend,
     session_trace_id: u32,
+    app_state: &AppState,
+    input_running: &AtomicBool,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), RuntimeError> {
     let session_trace = session_trace_label(session_trace_id);
     loop {
         if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if app_state.take_reconnect_request() {
+            log::info!("CrossPuck[{session_trace}] reconnect requested; ending session");
+            return Ok(());
+        }
+        if !input_running.load(Ordering::Relaxed) {
+            log::info!("CrossPuck[{session_trace}] input stream ended; ending session");
             return Ok(());
         }
         let frame = match control.read_frame() {
@@ -711,6 +841,7 @@ fn spawn_input_stream(
 ) -> Result<JoinHandle<()>, RuntimeError> {
     Ok(thread::spawn(move || {
         let Ok(mut reader) = with_worker_autorelease_pool(|| backend.open_input_reader()) else {
+            running.store(false, Ordering::Relaxed);
             return;
         };
         let start = Instant::now();
@@ -738,6 +869,7 @@ fn spawn_input_stream(
                 Err(_) => break,
             }
         }
+        running.store(false, Ordering::Relaxed);
     }))
 }
 
@@ -860,6 +992,7 @@ mod tests {
     use super::*;
     use crate::hid_backend::{HostBackend, HostInputReport, InputDescriptor, InputReportReader};
     use crosspuck_core::guest::{GuestTransportClient, GuestTransportConfig};
+    use crosspuck_core::hid::HidSnapshotError;
     use crosspuck_core::protocol::{
         Channel, CollectionDescriptor, CollectionRole, FeatureResult, IdentityPayload, LogSeverity,
         SetFeatureResult, SetOutputResult, StatusCode, WriteResult,
@@ -870,11 +1003,231 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
 
+    fn selection_candidates() -> Vec<(ConnectionMode, PuckSnapshot)> {
+        use crosspuck_core::hid::{build_session_snapshots, DeviceCandidate, VALVE_VENDOR_ID};
+        let candidates: Vec<_> = ConnectionMode::PRIORITY
+            .into_iter()
+            .map(|mode| DeviceCandidate {
+                path: mode.label().into(),
+                vendor_id: VALVE_VENDOR_ID,
+                product_id: mode.product_id(),
+                version_number: 1,
+                interface_number: if mode == ConnectionMode::Puck { 2 } else { -1 },
+                usage_page: 0xff00,
+                usage: 1,
+                manufacturer: None,
+                product: None,
+                serial: Some(format!("{}-serial", mode.label())),
+            })
+            .collect();
+        build_session_snapshots(&candidates)
+    }
+
+    #[test]
+    fn backend_selection_preserves_priority_and_reuses_success() {
+        for (fail_count, expected) in [
+            (0, ConnectionMode::Puck),
+            (1, ConnectionMode::WiredUsb),
+            (2, ConnectionMode::Bluetooth),
+        ] {
+            let mut calls = Vec::new();
+            let backend = Arc::new(());
+            let selected = prepare_session_backend(selection_candidates(), |mode, snapshot| {
+                calls.push(mode);
+                assert_eq!(snapshot.identity.product_id, mode.product_id());
+                if calls.len() <= fail_count {
+                    Err("main open failed")
+                } else {
+                    Ok(backend.clone())
+                }
+            })
+            .unwrap();
+            assert_eq!(selected.mode, expected);
+            assert_eq!(calls, ConnectionMode::PRIORITY[..=fail_count]);
+            assert!(Arc::ptr_eq(&selected.backend, &backend));
+            assert_eq!(selected.identity.product_id, expected.product_id());
+            assert_eq!(
+                selected.identity.serial,
+                format!("{}-serial", expected.label())
+            );
+            let main = selected
+                .identity
+                .collections
+                .iter()
+                .find(|c| c.role == crosspuck_core::protocol::CollectionRole::PuckMain)
+                .unwrap();
+            assert_eq!(
+                main.interface_number,
+                if expected == ConnectionMode::Puck {
+                    2
+                } else {
+                    0
+                }
+            );
+            assert_eq!(
+                main.input_report_len,
+                if expected == ConnectionMode::Puck {
+                    54
+                } else {
+                    46
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn backend_selection_uses_usb_when_puck_absent_and_aggregates_failures() {
+        let mut candidates = selection_candidates();
+        candidates.remove(0);
+        let selected = prepare_session_backend(candidates, |mode, _| Ok::<_, &str>(mode)).unwrap();
+        assert_eq!(selected.mode, ConnectionMode::WiredUsb);
+        let error = prepare_session_backend(selection_candidates(), |_, _| Err::<(), _>("denied"))
+            .err()
+            .unwrap();
+        for mode in ConnectionMode::PRIORITY {
+            assert!(error.contains(mode.label()));
+        }
+    }
+
+    #[test]
+    fn failed_selection_sends_only_disconnected_without_preamble() {
+        use crosspuck_core::protocol::Channel;
+        let listeners = TransportListeners::bind(TransportAddrs::loopback(0, 0)).unwrap();
+        let addrs = listeners.local_addrs().unwrap();
+        let app_state = Arc::new(AppState::new());
+        let server_state = app_state.clone();
+        let server = thread::spawn(move || {
+            let mut control = listeners.accept_control().unwrap();
+            handle_session_selecting_backend(
+                &listeners,
+                &mut control,
+                SessionConfig {
+                    session_id: 1,
+                    session_trace_id: 2,
+                    guest_runtime_overrides: GuestRuntimeOverrides::default(),
+                },
+                &server_state,
+                &Arc::new(AtomicBool::new(false)),
+                || Err("all main handles denied".into()),
+            )
+        });
+        let mut control = ChannelStream::connect(Channel::Control, addrs.control).unwrap();
+        write_payload(&mut control, 7, &Hello::new(42)).unwrap();
+        let response = control.read_frame().unwrap();
+        assert_eq!(response.header.message_type, MessageType::HelloOk);
+        assert_eq!(
+            HelloOk::decode(&response.payload).unwrap().status,
+            StatusCode::DeviceDisconnected
+        );
+        assert!(matches!(
+            server.join().unwrap(),
+            Err(RuntimeError::DeviceUnavailable(_))
+        ));
+        assert!(control.read_frame().is_err());
+        assert!(matches!(
+            app_state.snapshot(),
+            HostRuntimeState::Degraded { .. }
+        ));
+    }
+
+    #[test]
+    fn fallback_session_keeps_mode_until_force_reconnect_then_reselects() {
+        let listeners = TransportListeners::bind(TransportAddrs::loopback(0, 0)).unwrap();
+        let addrs = listeners.local_addrs().unwrap();
+        let app_state = AppState::new();
+        let server_state = app_state.clone();
+        let mut initial = selection_candidates();
+        initial.remove(0);
+        let candidates = Arc::new(Mutex::new(initial));
+        let server_candidates = candidates.clone();
+        let opens = Arc::new(Mutex::new(Vec::new()));
+        let server_opens = opens.clone();
+        let backend = FakeBackend::new(Vec::new());
+        let server_backend = backend.clone();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            for session_id in 1..=2 {
+                let mut control = listeners.accept_control().unwrap();
+                control
+                    .set_read_timeout(Some(Duration::from_millis(50)))
+                    .unwrap();
+                handle_session_selecting_backend(
+                    &listeners,
+                    &mut control,
+                    SessionConfig {
+                        session_id,
+                        session_trace_id: session_id,
+                        guest_runtime_overrides: GuestRuntimeOverrides::default(),
+                    },
+                    &server_state,
+                    &Arc::new(AtomicBool::new(false)),
+                    || {
+                        prepare_session_backend(
+                            server_candidates.lock().unwrap().clone(),
+                            |mode, _| {
+                                server_opens.lock().unwrap().push(mode);
+                                Ok::<_, &str>(
+                                    Arc::new(server_backend.clone()) as Arc<dyn HostBackend>
+                                )
+                            },
+                        )
+                    },
+                )
+                .unwrap();
+                finished_tx.send(()).unwrap();
+            }
+        });
+        let mut guest = GuestTransportClient::connect(GuestTransportConfig {
+            addrs,
+            ..GuestTransportConfig::default()
+        })
+        .unwrap();
+        assert_eq!(
+            guest.identity().product_id,
+            ConnectionMode::WiredUsb.product_id()
+        );
+        *candidates.lock().unwrap() = selection_candidates(); // higher-priority Puck appeared
+        assert!(guest.get_feature(0, 2, 64, 100).unwrap().status.is_ok());
+        assert!(matches!(
+            app_state.snapshot(),
+            HostRuntimeState::GuestConnected {
+                mode: ConnectionMode::WiredUsb,
+                ..
+            }
+        ));
+        assert_eq!(*opens.lock().unwrap(), vec![ConnectionMode::WiredUsb]);
+        app_state.request_reconnect();
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(guest);
+        let guest = GuestTransportClient::connect(GuestTransportConfig {
+            addrs,
+            ..GuestTransportConfig::default()
+        })
+        .unwrap();
+        assert_eq!(
+            guest.identity().product_id,
+            ConnectionMode::Puck.product_id()
+        );
+        drop(guest);
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            *opens.lock().unwrap(),
+            vec![ConnectionMode::WiredUsb, ConnectionMode::Puck]
+        );
+        assert!(backend
+            .operations()
+            .iter()
+            .any(|operation| operation.starts_with("get_feature:0:")));
+        assert!(backend.cleanup_called());
+    }
+
     #[derive(Clone)]
     struct FakeBackend {
         reports: Arc<Mutex<VecDeque<Vec<u8>>>>,
         operations: Arc<Mutex<Vec<String>>>,
         cleanup_called: Arc<AtomicBool>,
+        input_gone: bool,
     }
 
     impl FakeBackend {
@@ -883,6 +1236,7 @@ mod tests {
                 reports: Arc::new(Mutex::new(reports.into())),
                 operations: Arc::new(Mutex::new(Vec::new())),
                 cleanup_called: Arc::new(AtomicBool::new(false)),
+                input_gone: false,
             }
         }
 
@@ -903,6 +1257,7 @@ mod tests {
         fn open_input_reader(&self) -> Result<Box<dyn InputReportReader>, HostHidError> {
             Ok(Box::new(FakeInputReader {
                 reports: Arc::clone(&self.reports),
+                gone: self.input_gone,
             }))
         }
 
@@ -952,6 +1307,7 @@ mod tests {
 
     struct FakeInputReader {
         reports: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        gone: bool,
     }
 
     impl InputReportReader for FakeInputReader {
@@ -959,6 +1315,9 @@ mod tests {
             &mut self,
             _timeout: Duration,
         ) -> Result<Option<HostInputReport>, HostHidError> {
+            if self.gone {
+                return Err(HostHidError::Hid(HidSnapshotError::NoMatchingDevice));
+            }
             Ok(self
                 .reports
                 .lock()
@@ -1001,6 +1360,7 @@ mod tests {
                     },
                     hello_request_id: hello.header.id,
                     guest_pid: 1234,
+                    mode: ConnectionMode::Puck,
                 },
                 &AppState::new(),
                 test_identity(),
@@ -1087,6 +1447,7 @@ mod tests {
                         guest_runtime_overrides: GuestRuntimeOverrides::default(),
                         hello_request_id: hello.header.id,
                         guest_pid: 1234,
+                        mode: ConnectionMode::Puck,
                     },
                     &AppState::new(),
                     test_identity(),
@@ -1113,6 +1474,146 @@ mod tests {
     }
 
     #[test]
+    fn menu_view_labels_connection_mode() {
+        let connected = HostRuntimeState::PuckConnected {
+            serial: "FXB9961303C9C".to_string(),
+            mode: ConnectionMode::WiredUsb,
+        }
+        .menu_view();
+        assert_eq!(connected.status, "Wired USB connected");
+        assert_eq!(connected.puck, "FXB9961303C9C");
+
+        let guest = HostRuntimeState::GuestConnected {
+            session_id: 1,
+            session_trace_id: 0x12345,
+            serial: "FXB9961303C9C".to_string(),
+            guest_pid: 1234,
+            mode: ConnectionMode::Bluetooth,
+        }
+        .menu_view();
+        assert_eq!(guest.status, "Guest proxy connected (Bluetooth)");
+    }
+
+    #[test]
+    fn reconnect_request_is_taken_once_and_can_be_cleared() {
+        let app_state = AppState::new();
+        assert!(!app_state.take_reconnect_request());
+
+        app_state.request_reconnect();
+        assert!(app_state.take_reconnect_request());
+        assert!(!app_state.take_reconnect_request());
+
+        app_state.request_reconnect();
+        app_state.clear_reconnect_request();
+        assert!(!app_state.take_reconnect_request());
+    }
+
+    #[test]
+    fn host_session_ends_on_reconnect_request() {
+        let listeners = TransportListeners::bind(TransportAddrs::loopback(0, 0)).unwrap();
+        let addrs = listeners.local_addrs().unwrap();
+        let backend = FakeBackend::new(Vec::new());
+        let app_state = AppState::new();
+        let server_app_state = app_state.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let server = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let mut control = listeners.accept_control().unwrap();
+            let hello = control.read_frame().unwrap();
+            control
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            let result = handle_session_with_backend(
+                &listeners,
+                &mut control,
+                SessionStart {
+                    session_id: 1,
+                    session_trace_id: 0x12345,
+                    guest_runtime_overrides: GuestRuntimeOverrides::default(),
+                    hello_request_id: hello.header.id,
+                    guest_pid: 1234,
+                    mode: ConnectionMode::Puck,
+                },
+                &server_app_state,
+                test_identity(),
+                Arc::new(backend),
+                &server_stop,
+            );
+            result_tx.send(result.is_ok()).unwrap();
+        });
+
+        ready_rx.recv().unwrap();
+        let guest = GuestTransportClient::connect(GuestTransportConfig {
+            addrs,
+            guest_label: "host-reconnect-request-test".to_string(),
+            ..GuestTransportConfig::default()
+        })
+        .unwrap();
+
+        app_state.request_reconnect();
+        assert!(result_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert!(!app_state.take_reconnect_request());
+        drop(guest);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn host_session_ends_when_input_device_is_gone() {
+        let listeners = TransportListeners::bind(TransportAddrs::loopback(0, 0)).unwrap();
+        let addrs = listeners.local_addrs().unwrap();
+        let backend = FakeBackend {
+            input_gone: true,
+            ..FakeBackend::new(Vec::new())
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let server = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let mut control = listeners.accept_control().unwrap();
+            let hello = control.read_frame().unwrap();
+            control
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            let result = handle_session_with_backend(
+                &listeners,
+                &mut control,
+                SessionStart {
+                    session_id: 1,
+                    session_trace_id: 0x12345,
+                    guest_runtime_overrides: GuestRuntimeOverrides::default(),
+                    hello_request_id: hello.header.id,
+                    guest_pid: 1234,
+                    mode: ConnectionMode::Puck,
+                },
+                &AppState::new(),
+                test_identity(),
+                Arc::new(backend),
+                &server_stop,
+            );
+            result_tx.send(result.is_ok()).unwrap();
+        });
+
+        ready_rx.recv().unwrap();
+        let guest = GuestTransportClient::connect(GuestTransportConfig {
+            addrs,
+            guest_label: "host-input-gone-test".to_string(),
+            ..GuestTransportConfig::default()
+        })
+        .unwrap();
+
+        assert!(result_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        drop(guest);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn host_session_rejects_control_message_on_input_channel() {
         let listeners = TransportListeners::bind(TransportAddrs::loopback(0, 0)).unwrap();
         let addrs = listeners.local_addrs().unwrap();
@@ -1135,6 +1636,7 @@ mod tests {
                     guest_runtime_overrides: GuestRuntimeOverrides::default(),
                     hello_request_id: hello.header.id,
                     guest_pid: 1234,
+                    mode: ConnectionMode::Puck,
                 },
                 &AppState::new(),
                 test_identity(),
@@ -1197,6 +1699,7 @@ mod tests {
                     guest_runtime_overrides: GuestRuntimeOverrides::default(),
                     hello_request_id: hello.header.id,
                     guest_pid: 1234,
+                    mode: ConnectionMode::Puck,
                 },
                 &AppState::new(),
                 test_identity(),

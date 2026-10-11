@@ -35,6 +35,8 @@ export PATH="$fixture/bin:$PATH"
 export CROSSPUCK_TEST_FIXTURE="$fixture"
 export CROSSPUCK_SPARKLE_DIR="$sparkle_dir"
 unset CROSSPUCK_BUILD_VERSION CROSSPUCK_SPARKLE_FEED_URL
+# Fixtures must never inherit a maintainer's real signing identities.
+unset CROSSPUCK_APP_SIGN_IDENTITY CROSSPUCK_DMG_SIGN_IDENTITY
 
 expect_failure() {
   local label="$1"

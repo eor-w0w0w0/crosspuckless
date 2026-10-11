@@ -1,6 +1,6 @@
 use crosspuck_core::hid::{
-    open_path_with_new_api, snapshot_for_filter, HidCollectionInfo, HidCollectionRole, HidDevice,
-    HidFilter, HidSnapshotError, PuckSnapshot,
+    open_path_with_new_api, snapshot_for_filter, ConnectionMode, HidCollectionInfo,
+    HidCollectionRole, HidDevice, HidFilter, HidSnapshotError, PuckSnapshot,
 };
 use crosspuck_core::protocol::{
     session_trace_label, CollectionRole, FeatureResult, GetFeature, SetFeature, SetFeatureResult,
@@ -19,6 +19,7 @@ const FEATURE_REPORT_RETRY_DELAY: Duration = Duration::from_millis(2);
 const INPUT_REOPEN_BACKOFF: Duration = Duration::from_millis(25);
 const INPUT_ERROR_GRACE: Duration = Duration::from_secs(30);
 const INPUT_DISCONNECT_GRACE: Duration = Duration::from_secs(120);
+const INPUT_DEVICE_GONE_GRACE: Duration = Duration::from_secs(2);
 
 static HOST_LOG_SESSION_TRACE_ID: Mutex<Option<u32>> = Mutex::new(None);
 
@@ -77,6 +78,7 @@ pub(crate) struct HostInputReport {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RealHostBackend {
+    mode: ConnectionMode,
     snapshot: Arc<Mutex<PuckSnapshot>>,
     main: SharedMainDevice,
     interface_devices: Arc<Mutex<BTreeMap<u8, CachedInterfaceDevice>>>,
@@ -96,9 +98,10 @@ struct CachedInterfaceDevice {
 }
 
 impl RealHostBackend {
-    pub fn new(snapshot: PuckSnapshot) -> Result<Self, HostHidError> {
+    pub fn new(mode: ConnectionMode, snapshot: PuckSnapshot) -> Result<Self, HostHidError> {
         let main = Self::open_main_device(&snapshot)?;
         Ok(Self {
+            mode,
             snapshot: Arc::new(Mutex::new(snapshot)),
             main,
             interface_devices: Arc::new(Mutex::new(BTreeMap::new())),
@@ -119,7 +122,7 @@ impl RealHostBackend {
     }
 
     fn refresh_path_for_interface(&self, interface_number: u8) -> Option<String> {
-        let snapshot = snapshot_for_filter(&HidFilter::steam_puck()).ok()?;
+        let snapshot = snapshot_for_filter(&HidFilter::steam_controller(self.mode)).ok()?;
         let path = Self::path_in_snapshot(&snapshot, interface_number)?;
         if let Ok(mut current) = self.snapshot.lock() {
             *current = snapshot;
@@ -148,7 +151,7 @@ impl RealHostBackend {
 
     fn refresh_main_device(&self) -> Result<(), HostHidError> {
         crate::probe::note_hid_main_refresh_attempt();
-        let snapshot = snapshot_for_filter(&HidFilter::steam_puck())?;
+        let snapshot = snapshot_for_filter(&HidFilter::steam_controller(self.mode))?;
         let path = Self::path_in_snapshot(&snapshot, self.main.interface_number)
             .ok_or(HostHidError::MissingCollection(HidCollectionRole::PuckMain))?;
         crate::probe::note_hid_open_path_attempt();
@@ -254,7 +257,7 @@ impl RealHostBackend {
         role: CollectionRole,
     ) -> Result<(String, u16, HidDevice), HostHidError> {
         crate::probe::note_hid_interface_reopen_attempt();
-        let snapshot = snapshot_for_filter(&HidFilter::steam_puck())?;
+        let snapshot = snapshot_for_filter(&HidFilter::steam_controller(self.mode))?;
         let collection = snapshot
             .collections
             .iter()
@@ -848,6 +851,21 @@ impl CollectionInputReader {
                             self.consecutive_errors = 0;
                         }
                         Err(refresh_error)
+                            if missing_device_grace_elapsed(
+                                &refresh_error,
+                                first_error_at,
+                                now,
+                            ) =>
+                        {
+                            warn_host_guest_event!(
+                                "HID input device gone: interface={} role={:?} path={}",
+                                self.descriptor.interface_number,
+                                self.descriptor.role,
+                                self.path_text()
+                            );
+                            return Err(refresh_error);
+                        }
+                        Err(refresh_error)
                             if self.consecutive_errors == 1
                                 || self.consecutive_errors.is_multiple_of(40) =>
                         {
@@ -923,6 +941,14 @@ impl CollectionInputReader {
     }
 }
 
+fn missing_device_grace_elapsed(
+    error: &HostHidError,
+    first_error_at: Instant,
+    now: Instant,
+) -> bool {
+    error.is_no_matching_device() && now.duration_since(first_error_at) >= INPUT_DEVICE_GONE_GRACE
+}
+
 fn should_read_input_collection(collection: &HidCollectionInfo) -> bool {
     collection.input_report_len > 0
         && matches!(
@@ -991,6 +1017,12 @@ pub(crate) enum HostHidError {
     Hid(HidSnapshotError),
 }
 
+impl HostHidError {
+    fn is_no_matching_device(&self) -> bool {
+        matches!(self, Self::Hid(HidSnapshotError::NoMatchingDevice))
+    }
+}
+
 impl fmt::Display for HostHidError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1030,6 +1062,28 @@ impl From<HidSnapshotError> for HostHidError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_device_requires_two_seconds_before_session_end() {
+        let first = Instant::now();
+        let missing = HostHidError::Hid(HidSnapshotError::NoMatchingDevice);
+        assert!(!missing_device_grace_elapsed(
+            &missing,
+            first,
+            first + Duration::from_millis(1999)
+        ));
+        assert!(missing_device_grace_elapsed(
+            &missing,
+            first,
+            first + Duration::from_secs(2)
+        ));
+        let other = HostHidError::MissingCollection(HidCollectionRole::PuckMain);
+        assert!(!missing_device_grace_elapsed(
+            &other,
+            first,
+            first + Duration::from_secs(2)
+        ));
+    }
 
     #[test]
     fn accepts_known_transient_collection_probe_errors() {

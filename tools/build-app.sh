@@ -6,6 +6,7 @@ root_dir="$(cd "$(dirname "$0")/.." && pwd)"
 driver_target="x86_64-pc-windows-gnu"
 driver_profile="release"
 app_features="${CROSSPUCK_APP_FEATURES:-}"
+app_sign_identity="${CROSSPUCK_APP_SIGN_IDENTITY:-}"
 # Sparkle 2.10 and the app must agree on the supported operating system.
 export MACOSX_DEPLOYMENT_TARGET=12.0
 
@@ -202,5 +203,22 @@ cat > "$guest_driver_dir/manifest.json" <<EOF
   "size": $driver_size
 }
 EOF
+
+if [ -n "$app_sign_identity" ]; then
+  # Hardened Runtime must load Sparkle from the same signing team as the app.
+  # Sign nested code inside-out, retaining Downloader's sandbox entitlements.
+  framework="$frameworks_dir/Sparkle.framework"
+  codesign --force --timestamp --options runtime --sign "$app_sign_identity" \
+    "$framework/Versions/B/XPCServices/Installer.xpc" >&2
+  codesign --force --timestamp --options runtime --preserve-metadata=entitlements \
+    --sign "$app_sign_identity" "$framework/Versions/B/XPCServices/Downloader.xpc" >&2
+  codesign --force --timestamp --options runtime --sign "$app_sign_identity" \
+    "$framework/Versions/B/Autoupdate" >&2
+  codesign --force --timestamp --options runtime --sign "$app_sign_identity" \
+    "$framework/Versions/B/Updater.app" >&2
+  codesign --force --timestamp --options runtime --sign "$app_sign_identity" "$framework" >&2
+  codesign --force --timestamp --options runtime --sign "$app_sign_identity" "$app_dir" >&2
+  codesign --verify --deep --strict "$app_dir" >&2
+fi
 
 echo "$app_dir"
