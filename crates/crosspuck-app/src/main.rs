@@ -1,6 +1,8 @@
 use std::process::ExitCode;
 
 #[cfg(target_os = "macos")]
+mod audio;
+#[cfg(target_os = "macos")]
 mod bottle_config;
 #[cfg(target_os = "macos")]
 mod bundle;
@@ -55,6 +57,7 @@ fn main() -> ExitCode {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use crate::audio::AudioService;
     use crate::bottle_config::{duplicate_xinput_hidden, set_duplicate_xinput_hidden};
     use crate::driver_install::{
         check_driver_install_status, discover_bottle, find_steam_dir, install_driver,
@@ -95,6 +98,7 @@ mod macos {
         _bottle_controller: Retained<BottleController>,
         _reconnect_controller: Retained<ReconnectController>,
         _quit_controller: Retained<QuitController>,
+        _audio_controller: Retained<AudioController>,
         _updates: Retained<UpdateMenuController>,
         _app_delegate: Retained<AppDelegate>,
     }
@@ -111,6 +115,9 @@ mod macos {
         bottle_info: Retained<NSMenuItem>,
         bottle_choose: Retained<NSMenuItem>,
         bottle_reset: Retained<NSMenuItem>,
+        audio_enabled: Retained<NSMenuItem>,
+        audio_status: Retained<NSMenuItem>,
+        audio_service: AudioService,
         duplicate_xinput: Retained<NSMenuItem>,
     }
 
@@ -385,6 +392,37 @@ mod macos {
         }
     }
 
+    struct AudioControllerIvars {
+        items: StateMenuItems,
+    }
+
+    define_class!(
+        #[unsafe(super = NSObject)]
+        #[thread_kind = objc2::MainThreadOnly]
+        #[ivars = AudioControllerIvars]
+        struct AudioController;
+
+        unsafe impl NSObjectProtocol for AudioController {}
+
+        impl AudioController {
+            #[unsafe(method(toggleAudio:))]
+            fn toggle_audio(&self, _sender: Option<&AnyObject>) {
+                let items = &self.ivars().items;
+                let enabled = !items.audio_service.enabled();
+                crate::settings::set_follow_audio_output(enabled);
+                items.audio_service.set_enabled(enabled);
+                refresh_audio_items(items);
+            }
+        }
+    );
+
+    impl AudioController {
+        fn new(mtm: MainThreadMarker, items: StateMenuItems) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(AudioControllerIvars { items });
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
     struct QuitControllerIvars {
         app: Retained<NSApplication>,
     }
@@ -414,6 +452,7 @@ mod macos {
 
     struct AppDelegateIvars {
         service_handle: HostServiceHandle,
+        audio_service: AudioService,
     }
 
     define_class!(
@@ -427,16 +466,24 @@ mod macos {
         unsafe impl NSApplicationDelegate for AppDelegate {
             #[unsafe(method(applicationWillTerminate:))]
             fn application_will_terminate(&self, _notification: &NSNotification) {
-                // NSApplication reaches this for both the Quit menu and Sparkle's
-                // install/relaunch path. Give HID/IPC cleanup a bounded wait.
+                // Both Quit and Sparkle install/relaunch must restore audio
+                // and release HID/IPC resources before the app exits.
+                self.ivars().audio_service.shutdown();
                 self.ivars().service_handle.shutdown();
             }
         }
     );
 
     impl AppDelegate {
-        fn new(mtm: MainThreadMarker, service_handle: HostServiceHandle) -> Retained<Self> {
-            let this = Self::alloc(mtm).set_ivars(AppDelegateIvars { service_handle });
+        fn new(
+            mtm: MainThreadMarker,
+            service_handle: HostServiceHandle,
+            audio_service: AudioService,
+        ) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(AppDelegateIvars {
+                service_handle,
+                audio_service,
+            });
             unsafe { msg_send![super(this), init] }
         }
     }
@@ -456,6 +503,7 @@ mod macos {
             let app = NSApplication::sharedApplication(mtm);
             app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
+            let audio_service = AudioService::start(crate::settings::follow_audio_output());
             let app_state = AppState::new();
             let service_handle = start_host_service_with_config(
                 app_state.clone(),
@@ -464,11 +512,23 @@ mod macos {
                 },
             );
             log::info!("CrossPuck host app started");
-            let menu_objects = build_menu_bar(app.clone(), mtm, &app_state, service_handle);
+            let menu_objects = build_menu_bar(
+                app.clone(),
+                mtm,
+                &app_state,
+                service_handle,
+                audio_service.clone(),
+            );
+            // Keep targets/delegates alive for app.run without leaking their
+            // Rust owners (and the AudioService handles they retain).
             app.run();
+            audio_service.shutdown();
             menu_objects._refresh_timer.invalidate();
+            menu_objects._menu.setDelegate(None);
             menu_objects._app_delegate.ivars().service_handle.shutdown();
             app.setDelegate(None);
+            NSStatusBar::systemStatusBar().removeStatusItem(&menu_objects._status_item);
+            drop(menu_objects);
         }
 
         log::info!("CrossPuck host app stopped");
@@ -480,6 +540,7 @@ mod macos {
         mtm: MainThreadMarker,
         app_state: &AppState,
         service_handle: HostServiceHandle,
+        audio_service: AudioService,
     ) -> MenuBarObjects {
         let status_bar = NSStatusBar::systemStatusBar();
         let status_item = status_bar.statusItemWithLength(NSSquareStatusItemLength);
@@ -573,6 +634,20 @@ mod macos {
                 Some(sel!(resetBottle:)),
                 &empty_key,
             ),
+            audio_enabled: {
+                menu.addItem(&NSMenuItem::separatorItem(mtm));
+                menu.addItemWithTitle_action_keyEquivalent(
+                    &NSString::from_str("Follow macOS Audio Output"),
+                    Some(sel!(toggleAudio:)),
+                    &empty_key,
+                )
+            },
+            audio_status: menu.addItemWithTitle_action_keyEquivalent(
+                &NSString::from_str("Audio: Starting…"),
+                None,
+                &empty_key,
+            ),
+            audio_service: audio_service.clone(),
             duplicate_xinput: advanced_menu.addItemWithTitle_action_keyEquivalent(
                 &NSString::from_str("Hide Duplicate XInput Controller"),
                 Some(sel!(toggleDuplicateXInput:)),
@@ -585,6 +660,10 @@ mod macos {
         state_items.error.setEnabled(false);
         state_items.driver_status.setEnabled(false);
         state_items.bottle_info.setEnabled(false);
+        state_items.audio_status.setEnabled(false);
+        state_items
+            .audio_enabled
+            .setEnabled(audio_service.supported());
 
         let separator = NSMenuItem::separatorItem(mtm);
         menu.addItem(&separator);
@@ -627,6 +706,11 @@ mod macos {
 
         let updates = UpdateMenuController::new(mtm, &menu);
 
+        let audio_controller = AudioController::new(mtm, state_items.clone());
+        state_items
+            .audio_enabled
+            .setTarget(Some(audio_controller.as_ref()));
+
         let menu_delegate = StateMenuDelegate::new(
             mtm,
             app_state.clone(),
@@ -649,7 +733,7 @@ mod macos {
         let separator = NSMenuItem::separatorItem(mtm);
         menu.addItem(&separator);
 
-        let app_delegate = AppDelegate::new(mtm, service_handle);
+        let app_delegate = AppDelegate::new(mtm, service_handle, audio_service);
         app.setDelegate(Some(ProtocolObject::from_ref(&*app_delegate)));
         let quit_controller = QuitController::new(mtm, app.clone());
         let quit_title = NSString::from_str("Quit");
@@ -671,6 +755,7 @@ mod macos {
             _bottle_controller: bottle_controller,
             _reconnect_controller: reconnect_controller,
             _quit_controller: quit_controller,
+            _audio_controller: audio_controller,
             _updates: updates,
             _app_delegate: app_delegate,
         }
@@ -697,6 +782,20 @@ mod macos {
             .setTitle(&NSString::from_str(&format!("Last error: {}", view.error)));
         refresh_driver_items(driver_state, items);
         refresh_bottle_items(driver_state, items);
+        refresh_audio_items(items);
+    }
+
+    fn refresh_audio_items(items: &StateMenuItems) {
+        items
+            .audio_enabled
+            .setState(if items.audio_service.enabled() {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
+        items
+            .audio_status
+            .setTitle(&NSString::from_str(&items.audio_service.status().title()));
     }
 
     fn refresh_bottle_items(driver_state: &DriverMenuState, items: &StateMenuItems) {

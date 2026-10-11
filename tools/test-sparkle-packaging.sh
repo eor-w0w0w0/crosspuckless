@@ -29,6 +29,12 @@ printf 'fixture DLL' > "$CROSSPUCK_TEST_FIXTURE/target/x86_64-pc-windows-gnu/rel
 mkdir -p "$CROSSPUCK_TEST_FIXTURE/target/debug" "$CROSSPUCK_TEST_FIXTURE/target/release"
 printf 'fixture executable' > "$CROSSPUCK_TEST_FIXTURE/target/debug/CrossPuck"
 printf 'fixture executable' > "$CROSSPUCK_TEST_FIXTURE/target/release/CrossPuck"
+printf 'fixture audio helper' > "$CROSSPUCK_TEST_FIXTURE/target/debug/CrossPuckAudio"
+printf 'fixture audio helper' > "$CROSSPUCK_TEST_FIXTURE/target/release/CrossPuckAudio"
+SH
+cat > "$fixture/bin/codesign" <<'SH'
+#!/usr/bin/env sh
+printf '%s\n' "$*" >> "$CROSSPUCK_TEST_FIXTURE/codesign-calls"
 SH
 chmod +x "$fixture/bin/"* "$fixture/tools/"*.sh
 export PATH="$fixture/bin:$PATH"
@@ -64,6 +70,8 @@ test -x "$framework/Updater.app/Contents/MacOS/Updater"
 test -x "$framework/XPCServices/Installer.xpc/Contents/MacOS/Installer"
 test -x "$framework/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
 cmp "$sparkle_dir/LICENSE" "$fixture/target/debug/CrossPuck.app/Contents/Resources/Sparkle-LICENSE.txt"
+cmp "$fixture/target/debug/CrossPuckAudio" "$fixture/target/debug/CrossPuck.app/Contents/MacOS/CrossPuckAudio"
+/usr/libexec/PlistBuddy -c 'Print :NSAudioCaptureUsageDescription' "$plist" >/dev/null
 echo "PASS: debug bundle contains full framework, symlinks, license, and macOS 12 deployment target"
 
 before_calls="$(wc -l < "$fixture/cargo-calls")"
@@ -87,6 +95,27 @@ test "$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$plist")" = "$fixture
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = 0.4.1
 test "$(/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$plist")" = https://example.com/appcast.xml
 echo "PASS: release key, build number, and HTTPS feed overrides are embedded"
+
+CROSSPUCK_SPARKLE_PUBLIC_KEY="$fixture_public_key" \
+  CROSSPUCK_APP_SIGN_IDENTITY=fixture-identity \
+  "$fixture/tools/build-app.sh" release > "$fixture/signed.log" 2>&1
+python3 - "$fixture/codesign-calls" <<'PY'
+import sys
+from pathlib import Path
+commands = Path(sys.argv[1]).read_text().splitlines()
+signed = [line for line in commands if '--sign fixture-identity' in line]
+expected = ['/CrossPuckAudio', 'Installer.xpc', 'Downloader.xpc', '/Autoupdate',
+            '/Updater.app', '/Sparkle.framework', '/CrossPuck.app']
+assert len(signed) == len(expected), signed
+for line, suffix in zip(signed, expected):
+    assert line.endswith(suffix), line
+assert '--identifier com.github.scryner.crosspuck.audio' in signed[0]
+assert '--preserve-metadata=entitlements' in signed[2]
+assert all('--options runtime' in line and '--deep' not in line for line in signed)
+assert any('--verify --deep --strict' in line for line in commands)
+PY
+echo "PASS: app build signs audio helper and Sparkle before the app with the same identity"
+rm "$fixture/codesign-calls"
 
 # Exercise the DMG script using stubbed native tools; no volumes are mounted.
 cat > "$fixture/bin/codesign" <<'SH'
@@ -120,12 +149,12 @@ import sys
 from pathlib import Path
 commands = Path(sys.argv[1]).read_text().splitlines()
 signed = [line for line in commands if '--sign fixture-identity' in line]
-expected = ['Installer.xpc', 'Downloader.xpc', '/Autoupdate', '/Updater.app',
+expected = ['/CrossPuckAudio', 'Installer.xpc', 'Downloader.xpc', '/Autoupdate', '/Updater.app',
             '/Sparkle.framework', '/CrossPuck.app']
 assert len(signed) == len(expected), signed
 for line, suffix in zip(signed, expected):
     assert line.endswith(suffix), line
-assert '--preserve-metadata=entitlements' in signed[1]
+assert '--preserve-metadata=entitlements' in signed[2]
 assert all('--deep' not in line for line in signed)
 assert any('--verify --deep --strict' in line for line in commands)
 PY

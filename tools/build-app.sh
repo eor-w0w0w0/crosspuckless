@@ -174,6 +174,7 @@ guest_driver_dir="$resources_dir/GuestDriver"
 rm -rf "$app_dir"
 mkdir -p "$macos_dir" "$resources_dir" "$guest_driver_dir" "$frameworks_dir"
 cp "$root_dir/target/$profile/CrossPuck" "$macos_dir/CrossPuck"
+cp "$root_dir/target/$profile/CrossPuckAudio" "$macos_dir/CrossPuckAudio"
 cp "$root_dir/crates/crosspuck-app/Info.plist" "$contents_dir/Info.plist"
 set_bundle_version "$contents_dir/Info.plist" "$app_version"
 set_plist_string "$contents_dir/Info.plist" LSMinimumSystemVersion 12.0
@@ -207,6 +208,8 @@ EOF
 if [ -n "$app_sign_identity" ]; then
   # Hardened Runtime must load Sparkle from the same signing team as the app.
   # Sign nested code inside-out, retaining Downloader's sandbox entitlements.
+  codesign --force --timestamp --options runtime --sign "$app_sign_identity" \
+    --identifier com.github.scryner.crosspuck.audio "$macos_dir/CrossPuckAudio" >&2
   framework="$frameworks_dir/Sparkle.framework"
   codesign --force --timestamp --options runtime --sign "$app_sign_identity" \
     "$framework/Versions/B/XPCServices/Installer.xpc" >&2
@@ -219,6 +222,10 @@ if [ -n "$app_sign_identity" ]; then
   codesign --force --timestamp --options runtime --sign "$app_sign_identity" "$framework" >&2
   codesign --force --timestamp --options runtime --sign "$app_sign_identity" "$app_dir" >&2
   codesign --verify --deep --strict "$app_dir" >&2
+else
+  # Local audio permission checks need signatures even without a Developer ID.
+  codesign --force --sign - --identifier com.github.scryner.crosspuck.audio "$macos_dir/CrossPuckAudio" >&2
+  codesign --force --sign - --identifier com.github.scryner.crosspuck "$app_dir" >&2
 fi
 
 echo "$app_dir"

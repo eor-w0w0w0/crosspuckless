@@ -1,5 +1,7 @@
 #[cfg(any(windows, test))]
 mod connectivity;
+#[cfg(any(windows, test))]
+mod sdl_enumeration;
 
 #[cfg(windows)]
 mod windows;

@@ -1,5 +1,5 @@
 use crate::hid_backend::{
-    set_host_log_session_trace_id, HostBackend, HostHidError, RealHostBackend,
+    set_host_log_session_trace_id, HostBackend, HostHidError, InputReportReader, RealHostBackend,
 };
 use crate::user_activity::UserActivityReporter;
 use crosspuck_core::hid::{session_snapshots_for_known_modes, ConnectionMode, PuckSnapshot};
@@ -498,10 +498,16 @@ fn handle_session_selecting_backend(
         serial: identity.serial.clone(),
         mode,
     });
-    write_session_preamble(control, &session, &identity)?;
-    let input =
-        attach_input_for_session(listeners, stop, INPUT_ATTACH_TIMEOUT, &session, &identity)?;
-    run_attached_session(control, input, session, app_state, backend, stop, identity)
+    handle_session_with_backend_timeout(
+        listeners,
+        control,
+        session,
+        app_state,
+        identity,
+        backend,
+        stop,
+        INPUT_ATTACH_TIMEOUT,
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -536,7 +542,6 @@ fn handle_session_with_backend(
     )
 }
 
-#[cfg(test)]
 fn handle_session_with_backend_timeout(
     listeners: &TransportListeners,
     control: &mut ChannelStream,
@@ -552,10 +557,31 @@ fn handle_session_with_backend_timeout(
         mode: session.mode,
     });
 
+    // Do not acknowledge a usable device before the HID input reader opens.
+    // Otherwise automatic discovery could advertise a command-only session.
+    let reader = match with_worker_autorelease_pool(|| backend.open_input_reader()) {
+        Ok(reader) => reader,
+        Err(error) => {
+            write_payload(
+                control,
+                session.hello_request_id,
+                &hello_ok_with_status(
+                    StatusCode::DeviceDisconnected,
+                    session.session_id,
+                    session.session_trace_id,
+                    identity.default_input_report_len(),
+                ),
+            )?;
+            return Err(RuntimeError::DeviceUnavailable(error.to_string()));
+        }
+    };
     write_session_preamble(control, &session, &identity)?;
     let input =
         attach_input_for_session(listeners, stop, input_attach_timeout, &session, &identity)?;
-    run_attached_session(control, input, session, app_state, backend, stop, identity)
+
+    run_attached_session(
+        control, input, session, app_state, backend, reader, stop, identity,
+    )
 }
 
 fn write_session_preamble(
@@ -631,6 +657,7 @@ fn run_attached_session(
     session: SessionStart,
     app_state: &AppState,
     backend: Arc<dyn HostBackend>,
+    reader: Box<dyn InputReportReader>,
     stop: &Arc<AtomicBool>,
     identity: IdentityPayload,
 ) -> Result<(), RuntimeError> {
@@ -644,7 +671,7 @@ fn run_attached_session(
     set_host_log_session_trace_id(Some(session.session_trace_id));
 
     let input_running = Arc::new(AtomicBool::new(true));
-    let input_thread = spawn_input_stream(input, Arc::clone(&backend), Arc::clone(&input_running))?;
+    let input_thread = spawn_input_stream(input, reader, Arc::clone(&input_running))?;
     let control_result = run_control_loop(
         control,
         backend.as_ref(),
@@ -836,14 +863,10 @@ fn new_session_trace_id() -> u32 {
 
 fn spawn_input_stream(
     mut input: ChannelStream,
-    backend: Arc<dyn HostBackend>,
+    mut reader: Box<dyn InputReportReader>,
     running: Arc<AtomicBool>,
 ) -> Result<JoinHandle<()>, RuntimeError> {
     Ok(thread::spawn(move || {
-        let Ok(mut reader) = with_worker_autorelease_pool(|| backend.open_input_reader()) else {
-            running.store(false, Ordering::Relaxed);
-            return;
-        };
         let start = Instant::now();
         let mut sequence = 1_u32;
         let mut user_activity = UserActivityReporter::new(USER_ACTIVITY_INTERVAL);
@@ -1227,6 +1250,7 @@ mod tests {
         reports: Arc<Mutex<VecDeque<Vec<u8>>>>,
         operations: Arc<Mutex<Vec<String>>>,
         cleanup_called: Arc<AtomicBool>,
+        input_available: bool,
         input_gone: bool,
     }
 
@@ -1236,6 +1260,7 @@ mod tests {
                 reports: Arc::new(Mutex::new(reports.into())),
                 operations: Arc::new(Mutex::new(Vec::new())),
                 cleanup_called: Arc::new(AtomicBool::new(false)),
+                input_available: true,
                 input_gone: false,
             }
         }
@@ -1255,6 +1280,11 @@ mod tests {
 
     impl HostBackend for FakeBackend {
         fn open_input_reader(&self) -> Result<Box<dyn InputReportReader>, HostHidError> {
+            if !self.input_available {
+                return Err(HostHidError::MissingCollection(
+                    crosspuck_core::hid::HidCollectionRole::PuckMain,
+                ));
+            }
             Ok(Box::new(FakeInputReader {
                 reports: Arc::clone(&self.reports),
                 gone: self.input_gone,
@@ -1331,6 +1361,54 @@ mod tests {
                     data,
                 }))
         }
+    }
+
+    #[test]
+    fn host_rejects_handshake_when_input_reader_cannot_open() {
+        let listeners = TransportListeners::bind(TransportAddrs::loopback(0, 0)).unwrap();
+        let addrs = listeners.local_addrs().unwrap();
+        let server = thread::spawn(move || {
+            let mut control = listeners.accept_control().unwrap();
+            control
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let hello = control.read_frame().unwrap();
+            let backend = FakeBackend {
+                input_available: false,
+                ..FakeBackend::new(Vec::new())
+            };
+            let result = handle_session_with_backend(
+                &listeners,
+                &mut control,
+                SessionStart {
+                    session_id: 1,
+                    session_trace_id: 0x12345,
+                    guest_runtime_overrides: GuestRuntimeOverrides::default(),
+                    hello_request_id: hello.header.id,
+                    guest_pid: 1234,
+                    mode: ConnectionMode::Puck,
+                },
+                &AppState::new(),
+                test_identity(),
+                Arc::new(backend),
+                &Arc::new(AtomicBool::new(false)),
+            );
+            assert!(matches!(result, Err(RuntimeError::DeviceUnavailable(_))));
+        });
+        let mut control = ChannelStream::connect(Channel::Control, addrs.control).unwrap();
+        control
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write_payload(&mut control, 1, &Hello::new(1234)).unwrap();
+        let response = control.read_frame().unwrap();
+        assert_eq!(response.header.message_type, MessageType::HelloOk);
+        assert_eq!(
+            HelloOk::decode(&response.payload).unwrap().status,
+            StatusCode::DeviceDisconnected
+        );
+        // No successful identity or input attach is published on this session.
+        assert!(control.read_frame().is_err());
+        server.join().unwrap();
     }
 
     #[test]

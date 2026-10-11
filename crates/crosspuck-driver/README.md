@@ -4,6 +4,18 @@ Production guest-side `hid.dll` crate for CrossPuck.
 
 This crate owns the Windows DLL boundary: `DllMain`, hook installation, Win32 ABI buffers, handles, and error mapping. Protocol transport, host bridge runtime, virtual HID identity/profile calculations, and byte-preserving HID I/O routing live in `crosspuck-core::guest_driver`.
 
+In `steam.exe`, a process-lifetime worker retries host discovery independently of
+Steam's HID calls. Once identity and input-channel attachment are ready, a device
+generation advances the hooked `SDL_hid_device_change_count`, causing SDL to
+rescan. Connection loss advances the generation again. This allows CrossPuck to
+start or restart after Steam without reopening controller settings. HID calls
+only request a retry and inspect current state; connection attempts and teardown
+belong to the single connection worker.
+
+SDL enumeration results are copied into driver-owned lists, including native
+entries, and released by the matching free hook. Repeated discovery therefore
+does not leak synthetic lists or mix SDL and Rust allocation ownership.
+
 Build the target DLL with:
 
 ```sh

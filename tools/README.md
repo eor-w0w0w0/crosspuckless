@@ -250,6 +250,18 @@ check, automatic-check opt-in persistence, installation approval, host shutdown,
 whole-bundle replacement and restart, and then the bottle driver's separate
 update action. The initial rollout requires a manual DMG install.
 
+## Audio Routing
+
+Audio engine regression tests (macOS 14.2+, Clang with sanitizers):
+
+```sh
+sh tools/test-audio-engine.sh
+```
+
+Build the app with `tools/build-app.sh` so its `CrossPuckAudio` helper and
+system-audio usage description are included. See [audio routing](../docs/audio-routing.md)
+for lifecycle behavior and hardware validation.
+
 ## Logging
 
 Host app logs use macOS Unified Logging.
